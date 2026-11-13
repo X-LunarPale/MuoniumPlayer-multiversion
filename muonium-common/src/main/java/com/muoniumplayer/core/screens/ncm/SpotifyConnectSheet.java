@@ -1,6 +1,7 @@
 package com.muoniumplayer.core.screens.ncm;
 
 import com.muoniumplayer.core.management.FontManager;
+import com.muoniumplayer.core.ncm.music.CloudMusic;
 import com.muoniumplayer.core.ncm.music.MusicPlatform;
 import com.muoniumplayer.core.ncm.spotify.SpotifyAuthStore;
 import com.muoniumplayer.core.ncm.spotify.SpotifyConnectMirror;
@@ -143,7 +144,10 @@ public final class SpotifyConnectSheet extends NcmSheet {
         final java.util.function.DoubleSupplier centerX = () -> surface.getWidth() * .5;
         final RoundedButtonWidget prevBtn = action(surface, () -> PartyIcons.SKIP_PREVIOUS, () -> "",
                 FontManager.pf12bold, () -> NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT),
-                () -> runCommand(() -> SpotifyConnectService.previous("")));
+                () -> {
+                    if (SpotifyConnectMirror.isMirroring()) CloudMusic.prev();
+                    else runCommand(() -> SpotifyConnectService.previous(""));
+                });
         prevBtn.setBeforeRenderCallback(() -> {
             prevBtn.setBounds(44, 26);
             prevBtn.setPosition(centerX.getAsDouble() - 40 - 44, 84);
@@ -153,7 +157,10 @@ public final class SpotifyConnectSheet extends NcmSheet {
         });
         final RoundedButtonWidget playBtn = action(surface, this::transportGlyph, () -> "",
                 FontManager.pf12bold, () -> NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT),
-                () -> runCommand(() -> toggleTransport()));
+                () -> {
+                    if (SpotifyConnectMirror.isMirroring()) CloudMusic.togglePlayPause();
+                    else runCommand(this::toggleTransport);
+                });
         playBtn.setBeforeRenderCallback(() -> {
             playBtn.setBounds(80, 26);
             playBtn.setPosition(centerX.getAsDouble() - 40, 84);
@@ -163,7 +170,10 @@ public final class SpotifyConnectSheet extends NcmSheet {
         });
         final RoundedButtonWidget nextBtn = action(surface, () -> PartyIcons.SKIP_NEXT, () -> "",
                 FontManager.pf12bold, () -> NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT),
-                () -> runCommand(() -> SpotifyConnectService.next("")));
+                () -> {
+                    if (SpotifyConnectMirror.isMirroring()) CloudMusic.next();
+                    else runCommand(() -> SpotifyConnectService.next(""));
+                });
         nextBtn.setBeforeRenderCallback(() -> {
             nextBtn.setBounds(44, 26);
             nextBtn.setPosition(centerX.getAsDouble() + 40, 84);
@@ -400,6 +410,11 @@ public final class SpotifyConnectSheet extends NcmSheet {
             setStatus("先在「音乐来源 · Spotify」完成登录", 2);
             return;
         }
+        if (com.muoniumplayer.core.ncm.spotify.SpotifySoloistService.isPaired()) {
+            SpotifyConnectMirror.startSoloist();
+            setStatus("Soloist 接管已开启：模组界面跟随 Spotify 播放", 1);
+            return;
+        }
         if (!SpotifyAuthStore.snapshot().hasPlaybackScopes()) {
             setStatus("当前授权缺少播放控制权限（旧授权），请在登录页重新授权一遍", 2);
             return;
@@ -441,6 +456,9 @@ public final class SpotifyConnectSheet extends NcmSheet {
         long now = System.currentTimeMillis();
         if (!statusText.isEmpty() && now - statusAtMillis < STATUS_HOLD_MS) return statusText;
         if (!statusText.isEmpty()) statusText = "";
+        if (com.muoniumplayer.core.ncm.spotify.SpotifySoloistService.isPaired()) {
+            return com.muoniumplayer.core.ncm.spotify.SpotifySoloistService.statusMessage();
+        }
         if (!SpotifyMusicService.isLoggedIn()) return SpotifyMusicService.describeStatus();
         SpotifyAuthStore.Session session = SpotifyAuthStore.snapshot();
         if (!session.hasPlaybackScopes()) {

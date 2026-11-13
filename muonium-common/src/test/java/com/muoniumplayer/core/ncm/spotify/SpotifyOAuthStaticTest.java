@@ -27,6 +27,26 @@ class SpotifyOAuthStaticTest {
     }
 
     @Test
+    @DisplayName("首次使用无需注册开发者应用即可开始浏览器登录")
+    void firstUseCanAuthorizeWithoutDeveloperSetup() {
+        SpotifyConfigStore.clearForTest();
+        assertTrue(SpotifyConfigStore.snapshot().configured(),
+                "浏览器登录应提供可用身份，不应强制用户粘贴 Client ID");
+        String url = SpotifyOAuthFlow.buildAuthorizeUrl("state", "verifier");
+        assertTrue(url.contains("client_id=65b708073fc0480ea92a077233ca87bd"));
+        assertTrue(url.contains("redirect_uri=" + percentEncode("http://127.0.0.1:5588/login")));
+    }
+
+    @Test
+    @DisplayName("开发者登录继续使用自建 Client ID 与登记回调")
+    void developerLoginKeepsCustomClientAndRedirect() {
+        SpotifyConfigStore.putForTest("0123456789abcdefghijklmnopqrstuv", "US");
+        String url = SpotifyOAuthFlow.buildAuthorizeUrl("state", "verifier");
+        assertTrue(url.contains("client_id=0123456789abcdefghijklmnopqrstuv"));
+        assertTrue(url.contains("redirect_uri=" + percentEncode(SpotifyConfigStore.REDIRECT_URI)));
+    }
+
+    @Test
     @DisplayName("PKCE S256 challenge 与 RFC 7636 附录 B 官方向量一致")
     void pkceChallengeMatchesRfcVector() {
         // RFC 7636 Appendix B：verifier → BASE64URL(SHA256(ASCII(verifier)))
@@ -79,8 +99,15 @@ class SpotifyOAuthStaticTest {
     @Test
     @DisplayName("回调端口与重定向地址必须一致")
     void callbackPortMatchesRedirectUri() {
+        SpotifyConfigStore.putForTest("developer-client-id-for-test", "US");
         assertTrue(SpotifyConfigStore.REDIRECT_URI.endsWith(":" + SpotifyOAuthFlow.callbackPort() + "/callback"),
                 "REDIRECT_URI 与回调服务端口各写了一份，必须同步改");
+    }
+
+    @Test
+    void browserCallbackPortMatchesRedirectUri() {
+        SpotifyConfigStore.clearForTest();
+        assertEquals(5588, SpotifyOAuthFlow.callbackPort());
     }
 
     private static String percentEncode(String value) {

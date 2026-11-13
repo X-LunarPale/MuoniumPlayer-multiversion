@@ -39,6 +39,7 @@ import com.muoniumplayer.core.utils.other.multithreading.BackgroundWork;
 import com.muoniumplayer.core.utils.other.multithreading.MultiThreadingUtil;
 import com.muoniumplayer.party.MpPartyClient;
 import com.muoniumplayer.core.ncm.spotify.SpotifyConnectMirror;
+import com.muoniumplayer.core.ncm.spotify.SpotifySoloistService;
 
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
@@ -472,6 +473,7 @@ public class CloudMusic implements SharedConstants {
 
     public static void prev() {
         if (SpotifyConnectMirror.isMirroring()) {
+            if (MpPartyClient.interceptPrev()) return;
             SpotifyConnectMirror.previous();
             return;
         }
@@ -520,9 +522,9 @@ public class CloudMusic implements SharedConstants {
     }
 
     public static void next() {
-        // 镜像态下「下一首」属于外部播放器：我们的队列是空的，走下面的路径会变成
-        // 在本机悄悄起播一首自己的歌，而玩家的意图是让外部播放器切歌。
+        // Spotify 镜像负责将切歌分派到受管 Soloist 队列或外部设备。
         if (SpotifyConnectMirror.isMirroring()) {
+            if (MpPartyClient.interceptNext()) return;
             SpotifyConnectMirror.next();
             return;
         }
@@ -648,6 +650,21 @@ public class CloudMusic implements SharedConstants {
     public static boolean playNext(Music song) {
         if (song == null) return false;
         if (MpPartyClient.interceptPlayNext(song)) return true;
+        if (SpotifyConnectMirror.isSoloist()) {
+            if (!song.isSpotify()) {
+                DownloadDynamicIsland.showPlaybackFailure(song.getName(), "Soloist 播放队列只能加入 Spotify 歌曲");
+                return false;
+            }
+            if (!SpotifyConnectMirror.managesSoloistQueue() && currentlyPlaying != null
+                    && currentlyPlaying.isSpotify()) {
+                synchronized (PLAY_NEXT_LOCK) {
+                    playList = new ArrayList<>(Collections.singletonList(currentlyPlaying));
+                    curIdx = 0;
+                    clearQueuedNext();
+                }
+                SpotifyConnectMirror.manageCurrentSoloistTrack(currentlyPlaying);
+            }
+        }
 
         int rank;
         boolean startDirectly;
@@ -656,7 +673,8 @@ public class CloudMusic implements SharedConstants {
             // 锁外捕获的实例往里插，歌单换得快的话那一首就进了一条没人播的孤儿列表，
             // 而通知照样告诉用户「已排在第 N 位」。
             List<Music> queue = playList;
-            startDirectly = queue == null || queue.isEmpty() || currentlyPlaying == null || curIdx < 0;
+            startDirectly = queue == null || queue.isEmpty() || curIdx < 0
+                    || currentlyPlaying == null && !SpotifyConnectMirror.managesSoloistQueue();
             if (startDirectly) {
                 rank = 1;
             } else {
@@ -1553,9 +1571,33 @@ public class CloudMusic implements SharedConstants {
     }
 
     @SneakyThrows
+    private static void startSoloistPlaybackList(List<Music> songs, int startIdx) {
+        if (MpPartyClient.interceptStartPlayback(songs, startIdx)) return;
+        LiveStreamSession.stop("soloistSelection");
+        stopExistingPlayThread();
+        discardResumeOffset();
+        awaitingPlaybackAction = false;
+        List<Music> safeQueue = new ArrayList<>(songs);
+        int selectedIndex = Math.max(0, Math.min(normalizeStartIndex(startIdx), safeQueue.size() - 1));
+        if (playMode == PlayMode.Random) selectedIndex = handleRandomPlayMode(safeQueue, selectedIndex);
+        synchronized (PLAY_NEXT_LOCK) {
+            playList = safeQueue;
+            curIdx = selectedIndex;
+            clearQueuedNext();
+        }
+        SpotifyConnectMirror.playSoloistTrack(safeQueue.get(selectedIndex));
+    }
+
+    @SneakyThrows
     private static void startPlaybackList(List<Music> songs, int startIdx) {
         if (songs == null || songs.isEmpty()) {
             System.err.println("[NCM] Ignoring empty playlist.");
+            return;
+        }
+
+        Music selected = songs.get(Math.max(0, Math.min(normalizeStartIndex(startIdx), songs.size() - 1)));
+        if (selected != null && selected.isSpotify() && SpotifySoloistService.isPaired()) {
+            startSoloistPlaybackList(songs, startIdx);
             return;
         }
 
@@ -1594,6 +1636,42 @@ public class CloudMusic implements SharedConstants {
         playList = safeSongList;
         clearQueuedNext();
         startNewPlayThread(safeSongList, startIdx);
+    }
+
+    /** Main-thread queue control for Soloist; no audio thread or network work runs here. */
+    public static void stepSoloistQueue(int direction, boolean naturalEnd) {
+        if (!SpotifyConnectMirror.managesSoloistQueue()) return;
+        Music selected = selectSoloistQueueStep(direction, naturalEnd);
+        if (selected != null) SpotifyConnectMirror.playSoloistTrack(selected);
+    }
+
+    public static void replaySoloistQueueTrack() {
+        if (!SpotifyConnectMirror.managesSoloistQueue()) return;
+        Music selected;
+        synchronized (PLAY_NEXT_LOCK) {
+            selected = curIdx >= 0 && curIdx < playList.size() ? playList.get(curIdx) : null;
+        }
+        if (selected != null) SpotifyConnectMirror.playSoloistTrack(selected);
+    }
+
+    /** Selection rules match the internal queue, including single-repeat's user-queue exception. */
+    static Music selectSoloistQueueStep(int direction, boolean naturalEnd) {
+        synchronized (PLAY_NEXT_LOCK) {
+            if (playList == null || playList.isEmpty() || curIdx < 0 || curIdx >= playList.size()) return null;
+            int next = curIdx + (direction < 0 ? -1 : 1);
+            if (naturalEnd && playMode == PlayMode.LoopSingle && !hasQueuedNext()) next = curIdx;
+            if (next < 0 || next >= playList.size()) {
+                if (playMode == PlayMode.Sequential) return null;
+                if (playMode == PlayMode.Random && next >= playList.size()) Collections.shuffle(playList);
+                next = direction < 0 ? playList.size() - 1 : 0;
+                clearQueuedNext();
+            }
+            Music selected = playList.get(next);
+            if (selected == null || !selected.isSpotify()) return null;
+            curIdx = next;
+            queueRevision++;
+            return selected;
+        }
     }
 
     public static boolean isPersonalFmActive() {
@@ -5778,29 +5856,45 @@ public class CloudMusic implements SharedConstants {
      *
      * <p>协议与 {@link ExternalPlayback} 的 apply 一致：接管前必须先把内部音频真的停下来
      * （否则「内置播放的一首」与「Spotify 在放的另一首」同时存在，界面却只显示后者）；
-     * 然后按「递增 generation 作废旧会话 → 新建 PlaybackSession → 写 currentlyPlaying →
-     * 清队列」的顺序换血。放在这一侧而不是镜像侧，是因为队列与 queued-next 的清理要碰
-     * 包内私有成员。歌词走 {@link #loadLyric}：Spotify 行没有本家词，会落进按标题搜索的
-     * 兜底链，找不到就显示「暂无歌词」。</p>
+     * 再按选曲身份保留 Soloist 队列或清理外部接管队列，并创建新的 PlaybackSession。
+     * 队列与 queued-next 的维护留在此处；歌词走 {@link #loadLyric}，优先 QQ 逐字歌词，
+     * 其他来源及 Spotify 逐行歌词沿现有回退链处理。</p>
      */
     public static void adoptExternalMirrorTrack(Music music) {
-        if (player != null) {
+        adoptExternalMirrorTrack(music, false);
+    }
+
+    /** keepQueue is used only for a confirmed selection owned by the current Soloist session. */
+    public static void adoptExternalMirrorTrack(Music music, boolean keepQueue) {
+        stopExistingPlayThread();
+        AudioPlayer oldPlayer = player;
+        player = null;
+        if (oldPlayer != null) {
             try {
-                stopPlaybackAndClear(currentlyPlaying);
+                oldPlayer.stopForReplacement();
+                AudioPlayer.releaseLater(oldPlayer::close);
             } catch (Throwable failure) {
                 System.err.println("[Music/Spotify] 接管前停内部播放失败: " + failure);
             }
-            player = null;
         }
         // 直播流与 SMTC 接管同一条互斥纪律：不写 player，得显式停（否则双声源）。
         LiveStreamSession.stop("mirrorTakeover");
+        synchronized (PLAY_NEXT_LOCK) {
+            if (keepQueue && curIdx >= 0 && curIdx < playList.size()
+                    && playList.get(curIdx).isSpotify()
+                    && playList.get(curIdx).getSourceId().equals(music.getSourceId())) {
+                music = playList.get(curIdx);
+                noteQueuedTrackStarted(music);
+            } else {
+                playList = new ArrayList<Music>();
+                curIdx = 0;
+                clearQueuedNext();
+            }
+        }
         long sessionId = generation.incrementAndGet();
         PlaybackSession session = new PlaybackSession(sessionId, music.getStableKey(), music.getId());
         currentSession = session;
         currentlyPlaying = music;
-        playList = new ArrayList<Music>();
-        curIdx = 0;
-        clearQueuedNext();
         loadLyric(music, session);
     }
 
@@ -6127,6 +6221,28 @@ public class CloudMusic implements SharedConstants {
 
         if (previousLyric != currentLyric) {
             resetLyricPositionUpdate();
+        }
+    }
+
+    private static PlaybackSession diagnosedMirrorLyricSession;
+
+    /** 主线程循环驱动外部播放的当前句；不依赖播放器页面或内部解码线程。 */
+    public static void tickMirroredLyrics() {
+        if (!ExternalPlayback.isMirroring() && !SpotifyConnectMirror.isMirroring()) {
+            diagnosedMirrorLyricSession = null;
+            return;
+        }
+        if (!lyricsMatchCurrentTrack()) return;
+        PlaybackSnapshot snapshot = getSnapshot();
+        if (snapshot.music == null || !snapshot.music.getStableKey().equals(lyricsTrackKey)) return;
+        updateCurrentLyric(snapshot.positionMs);
+        PlaybackSession session = currentSession;
+        if (session != null && diagnosedMirrorLyricSession != session) {
+            diagnosedMirrorLyricSession = session;
+            org.apache.logging.log4j.LogManager.getLogger("MuoniumPlayer/Lyrics").info(
+                    "外部歌词时钟就绪：track={} playing={} positionMs={} lines={} hud={} world3d={}",
+                    lyricsTrackKey, snapshot.playing, snapshot.positionMs, lyrics.size(),
+                    HudConfig.musicLyricsEnabled, HudConfig.worldLyricsEnabled);
         }
     }
 

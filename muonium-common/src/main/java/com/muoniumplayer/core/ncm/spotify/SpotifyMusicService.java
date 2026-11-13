@@ -62,6 +62,31 @@ public final class SpotifyMusicService {
         public boolean local;
     }
 
+    /** Track IDs retain their historical form; episodes carry a prefix to preserve playable identity. */
+    static String sourceIdFromUri(String uri) {
+        if (uri == null || !uri.matches("spotify:(?:track|episode):[0-9A-Za-z]{22}")) return "";
+        return uri.startsWith("spotify:episode:") ? uri.substring(8) : uri.substring(14);
+    }
+
+    static String playableUri(String id) {
+        if (id == null || !id.matches("(?:episode:)?[0-9A-Za-z]{22}"))
+            throw new IllegalArgumentException("Spotify playable item id");
+        return id.startsWith("episode:") ? "spotify:" + id : "spotify:track:" + id;
+    }
+
+    /** Music uploads can credit the performer in a leading title–artist description. */
+    static String episodeArtist(String name, String description, String fallback) {
+        String text = description == null ? "" : description.replaceAll("<[^>]+>", " ").trim();
+        if (name != null && !name.isEmpty() && text.startsWith(name)) {
+            String credit = text.substring(name.length()).trim();
+            if (credit.matches("^[-–—－].+")) {
+                credit = credit.substring(1).trim().split("[\\r\\n]|\\s+(?:感[謝谢]|Powered by)", 2)[0].trim();
+                if (!credit.isEmpty() && credit.length() <= 80) return credit;
+            }
+        }
+        return fallback == null ? "" : fallback;
+    }
+
     /** 一张 Spotify 歌单 / 专辑的卡片元数据。 */
     public static final class Playlist {
         public String id = "";
@@ -84,6 +109,7 @@ public final class SpotifyMusicService {
         List<Track> out = new ArrayList<>();
         int cursor = Math.max(0, offset);
         try {
+            if (SpotifyDesktopCatalog.usesDesktopSession()) return SpotifyDesktopCatalog.search(keyword, total, offset);
             while (out.size() < total) {
                 int requested = Math.min(SEARCH_PAGE_LIMIT, total - out.size());
                 Map<String, String> query = baseSearchQuery(keyword, requested);
@@ -135,6 +161,13 @@ public final class SpotifyMusicService {
      */
     public static List<Playlist> userPlaylists(int limit) {
         List<Playlist> out = new ArrayList<>();
+        if (SpotifyDesktopCatalog.usesDesktopSession()) {
+            try { return SpotifyDesktopCatalog.userPlaylists(limit); }
+            catch (IOException | SpotifyWebApiClient.SpotifyApiException failure) {
+                logFailure("本人歌单", failure);
+                return out;
+            }
+        }
         try {
             JsonObject me = SpotifyWebApiClient.getJson("/me", null);
             SpotifyAuthStore.updateProfile(text(me, "display_name"), text(me, "id"),
@@ -162,6 +195,7 @@ public final class SpotifyMusicService {
     public static List<Track> playlistTracks(String platformPlaylistId, int max) {
         String id = platformPlaylistId == null ? "" : platformPlaylistId.trim();
         try {
+            if (SpotifyDesktopCatalog.usesDesktopSession()) return SpotifyDesktopCatalog.playlistTracks(id, max);
             if (id.equals(LIKED_PLAYLIST_ID)) return likedTracks(Math.max(1, max));
             if (id.startsWith(ALBUM_PREFIX)) return albumTracks(id.substring(ALBUM_PREFIX.length()),
                     Math.max(1, max));
@@ -176,6 +210,7 @@ public final class SpotifyMusicService {
     public static Playlist albumCard(String albumId) {
         if (albumId == null || albumId.trim().isEmpty()) return null;
         try {
+            if (SpotifyDesktopCatalog.usesDesktopSession()) return SpotifyDesktopCatalog.albumCard(albumId.trim());
             JsonObject payload = SpotifyWebApiClient.getJson("/albums/" + albumId.trim(), null);
             Playlist card = new Playlist();
             card.id = ALBUM_PREFIX + albumId.trim();
@@ -200,22 +235,57 @@ public final class SpotifyMusicService {
     private static volatile boolean userPlaylistsLoaded;
     private static volatile boolean userPlaylistsLoading;
     private static volatile long userPlaylistsLastAttempt;
+    private static long playlistAuthGeneration = -1;
+    private static volatile String userPlaylistsError = "";
+
+    private static long preparePlaylistCache() {
+        synchronized (PLAYLIST_LOCK) {
+            long current = SpotifyAuthStore.snapshot().generation;
+            if (playlistAuthGeneration != current) {
+                playlistAuthGeneration = current;
+                userPlaylistsSnapshot = Collections.emptyList();
+                userPlaylistsLoaded = false;
+                userPlaylistsLoading = false;
+                userPlaylistsLastAttempt = 0;
+                userPlaylistsError = "";
+            }
+            return current;
+        }
+    }
+
+    private static void publishPlaylists(List<PlayList> cards, long generation) {
+        synchronized (PLAYLIST_LOCK) {
+            if (generation != preparePlaylistCache()) return;
+            userPlaylistsSnapshot = cards;
+            userPlaylistsLoaded = true;
+            userPlaylistsError = "";
+        }
+    }
+
+    public static String getUserPlaylistsError() {
+        preparePlaylistCache();
+        return userPlaylistsError;
+    }
 
     public static java.util.List<PlayList> getUserPlaylistsSnapshot() {
+        preparePlaylistCache();
         return new ArrayList<>(userPlaylistsSnapshot);
     }
 
     public static boolean areUserPlaylistsLoaded() {
+        preparePlaylistCache();
         return userPlaylistsLoaded;
     }
 
     public static boolean areUserPlaylistsLoading() {
+        preparePlaylistCache();
         return userPlaylistsLoading;
     }
 
     /** 回调运行在后台线程；UI 调用方要自己切回主线程。 */
     public static void ensureUserPlaylistsAsync(final Runnable callback) {
-        if (!isLoggedIn()) {
+        final long attempt = preparePlaylistCache();
+        if (!SpotifyAuthStore.isLoggedIn()) {
             clearPlaylistCache();
             if (callback != null) callback.run();
             return;
@@ -239,7 +309,7 @@ public final class SpotifyMusicService {
                 System.err.println("[Music/Spotify] 本人歌单加载失败: " + throwable.getMessage());
             } finally {
                 synchronized (PLAYLIST_LOCK) {
-                    userPlaylistsLoading = false;
+                    if (attempt == preparePlaylistCache()) userPlaylistsLoading = false;
                 }
                 if (callback != null) {
                     try {
@@ -255,6 +325,21 @@ public final class SpotifyMusicService {
 
     /** 强制重拉账号歌单（侧栏刷新按钮用）。结果在后台线程落快照。 */
     public static void refreshUserPlaylists() {
+        final long attempt = preparePlaylistCache();
+        if (SpotifyDesktopCatalog.usesDesktopSession()) {
+            try {
+                List<PlayList> cards = new ArrayList<>();
+                for (Playlist playlist : SpotifyDesktopCatalog.userPlaylists(20000)) {
+                    PlayList card = toPlayListCard(playlist);
+                    if (card != null) cards.add(card);
+                }
+                publishPlaylists(cards, attempt);
+            } catch (IOException | SpotifyWebApiClient.SpotifyApiException failure) {
+                logFailure("本人歌单", failure);
+                if (attempt == preparePlaylistCache()) userPlaylistsError = playlistFailureMessage(failure);
+            }
+            return;
+        }
         List<PlayList> cards = new ArrayList<>();
         Playlist liked = likedPlaylistCard();
         if (liked != null) {
@@ -271,6 +356,7 @@ public final class SpotifyMusicService {
                 payload = SpotifyWebApiClient.getJson("/me/playlists", query);
             } catch (IOException | SpotifyWebApiClient.SpotifyApiException throwable) {
                 logFailure("本人歌单", throwable);
+                if (attempt == preparePlaylistCache()) userPlaylistsError = playlistFailureMessage(throwable);
                 return; // 失败保留旧快照：上次的结果还在，别把侧栏刷空。
             }
             List<Playlist> page = readPlaylists(payload, "items");
@@ -281,8 +367,7 @@ public final class SpotifyMusicService {
             }
             offset += page.size();
         }
-        userPlaylistsSnapshot = cards;
-        userPlaylistsLoaded = true;
+        publishPlaylists(cards, attempt);
     }
 
     private static void clearPlaylistCache() {
@@ -291,10 +376,11 @@ public final class SpotifyMusicService {
     }
 
     public static boolean isLoggedIn() {
-        return SpotifyAuthStore.isLoggedIn();
+        return SpotifyAuthStore.isLoggedIn() || SpotifySoloistService.isPaired();
     }
 
     public static String getAccountName() {
+        if (SpotifySoloistService.isPaired()) return "Soloist 已配对";
         SpotifyAuthStore.Session session = SpotifyAuthStore.snapshot();
         if (session.isReauthRequired() && !session.tokenReady()) return "授权已过期，请重新登录";
         if (!session.loggedIn) return "未登录";
@@ -307,10 +393,13 @@ public final class SpotifyMusicService {
 
     /** 登录状态一句话描述；登录页与账号卡共用。 */
     public static String describeStatus() {
+        if (SpotifySoloistService.isPaired()) return SpotifyAuthStore.isLoggedIn()
+                ? "Soloist 已配对 · 账号已授权，可刷新歌单"
+                : "Soloist 已配对 · 点击账号授权后可读取歌单";
         SpotifyAuthStore.Session session = SpotifyAuthStore.snapshot();
         if (session.isReauthRequired() && !session.canRefresh()) return "凭据已失效，请重新授权";
         if (session.isReauthRequired()) return "凭据疑似过期，稍后会自动重试；失败请重新授权";
-        if (!session.loggedIn) return "未登录：粘贴 Client ID 并完成浏览器授权后，可浏览本人歌单与喜欢的歌";
+        if (!session.loggedIn) return "未登录：选择浏览器、开发者或 Soloist 登录";
         return "已登录：" + (session.accountName.isEmpty() ? "Spotify 账号" : session.accountName)
                 + " · 播放始终由跨平台换源匹配";
     }
@@ -318,6 +407,7 @@ public final class SpotifyMusicService {
     /** 退出登录：清凭据与账号歌单快照；Connect 镜像（若在接管）一并断开。 */
     public static void logout() {
         SpotifyConnectMirror.stop("已退出 Spotify 登录");
+        SpotifySoloistService.disconnectAndDisableReconnect();
         SpotifyAuthStore.clear();
         clearPlaylistCache();
     }
@@ -330,6 +420,9 @@ public final class SpotifyMusicService {
     /** 配置的一句话诊断；形状不对的 Client ID 在这里被拦下并说清原因。 */
     public static String describeConfig() {
         SpotifyConfigStore.Config config = SpotifyConfigStore.snapshot();
+        if (config.loginMode == SpotifyConfigStore.LoginMode.BROWSER) {
+            return "浏览器登录已就绪（market " + config.market + "）";
+        }
         if (config.clientId.isEmpty()) {
             return "未配置：先到 developer.spotify.com/dashboard 自建应用（勾选 Web API，"
                     + "Redirect URI 填 " + SpotifyConfigStore.REDIRECT_URI + "），再把 Client ID 粘进来";
@@ -370,10 +463,11 @@ public final class SpotifyMusicService {
         List<Track> out = new ArrayList<>();
         int offset = 0;
         while (out.size() < max) {
-            int requested = Math.min(100, max - out.size());
+            int requested = Math.min(50, max - out.size());
             Map<String, String> query = new LinkedHashMap<>();
             query.put("limit", String.valueOf(requested));
             query.put("offset", String.valueOf(offset));
+            query.put("additional_types", "track,episode");
             // 2026-02 迁移：开发模式应用的端点从 /tracks 改名 /items；旧端点只对扩展配额应用还在。
             // 新端点 404（扩展配额应用没拿到新端点）时回落一次旧端点，两种应用都能读。
             JsonObject payload;
@@ -503,6 +597,15 @@ public final class SpotifyMusicService {
         out.id = text(track, "id");
         if (out.local || out.id.isEmpty()) return null;
         out.name = text(track, "name");
+        if ("episode".equals(text(track, "type"))) {
+            out.id = "episode:" + out.id;
+            JsonObject show = track.has("show") && track.get("show").isJsonObject()
+                    ? track.getAsJsonObject("show") : new JsonObject();
+            out.album = text(show, "name");
+            out.albumId = text(show, "id");
+            out.artist = episodeArtist(out.name, text(track, "description"), text(show, "publisher"));
+            out.coverUrl = firstImageUrl(track.getAsJsonArray("images"));
+        }
         out.durationMillis = track.has("duration_ms") && track.get("duration_ms").isJsonPrimitive()
                 ? track.get("duration_ms").getAsLong() : 0L;
         if (track.has("artists") && track.get("artists").isJsonArray()) {
@@ -593,13 +696,27 @@ public final class SpotifyMusicService {
      * 失败记账。未登录与需重新授权是「预期内」的状态（UI 有引导位），其余如实进日志 ——
      * 搜索静默失败只会表现为「SP 什么都搜不到」，没有日志就是无头案。
      */
-    private static void logFailure(String what, Throwable throwable) {
-        if (throwable instanceof SpotifyWebApiClient.SpotifyApiException) {
-            SpotifyWebApiClient.SpotifyApiException api = (SpotifyWebApiClient.SpotifyApiException) throwable;
-            if (api.reauthRequired) {
-                SpotifyAuthStore.markReauthRequired();
-            }
+    private static String playlistFailureMessage(Throwable failure) {
+        if (failure instanceof SpotifyWebApiClient.SpotifyApiException) {
+            SpotifyWebApiClient.SpotifyApiException api = (SpotifyWebApiClient.SpotifyApiException) failure;
+            if (api.reauthRequired) return "Spotify 授权已失效，请重新授权";
+            if (api.statusCode == 0) return "尚未完成 Spotify 账号授权";
+            String reason = api.statusCode == 403 ? "Spotify 拒绝客户端请求"
+                    : api.statusCode == 429 ? "请求过于频繁，请稍后刷新"
+                    : api.statusCode >= 500 ? "Spotify 服务暂不可用，请稍后刷新" : "Spotify 请求失败";
+            return "歌单读取失败（HTTP " + api.statusCode + "）：" + reason;
         }
+        if (failure instanceof java.net.SocketTimeoutException) return "读取歌单连接超时，请检查网络后刷新";
+        // Local validation and I/O messages contain no request headers or token bodies.
+        String detail = failure.getMessage();
+        if (detail == null || detail.isBlank()) return "歌单读取失败，请检查网络后刷新";
+        detail = detail.replaceAll("[\\r\\n\\t]", " ");
+        return "歌单读取失败：" + detail.substring(0, Math.min(140, detail.length()));
+    }
+
+    private static void logFailure(String what, Throwable throwable) {
+        // The HTTP client invalidates only the session that issued the request.
+        // Logging a late failure must not invalidate a newly authorized account.
         System.err.println("[Music/Spotify] " + what + "失败: " + throwable.getMessage());
     }
 

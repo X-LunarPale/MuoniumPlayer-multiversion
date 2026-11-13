@@ -24,17 +24,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * QQ 音乐 QRC 逐字歌词。歌词链路里排在 AMLL TTML 词库之后、所有普通歌词之前。
- *
- * <p>为什么需要它:AMLL 词库是人工投稿的,覆盖率有限;而 QQ 音乐自己的 QRC 是音节级时间轴,覆盖面
- * 比任何开放词库都大。所以顺序是 <b>AMLL TTML(逐字) → QQ QRC(逐字) → 普通歌词(兜底)</b>,
- * 逐字歌词永远优先,只有两条逐字链路都拿不到东西时才会退回行级 LRC。</p>
+ * QQ 音乐 QRC 逐字歌词。自动歌词链路优先尝试本源，顺序由 LyricLoadService 统一决定。
  *
  * <p>流程:</p>
  * <ol>
  *   <li>能直接拿到 QQ 数字 songid 的曲目(QQ 源、GD 的 tencent 平台)直接用它请求;</li>
- *   <li>否则用 {@code search_for_qq_cp} 搜索并在本地打分,<b>宁可没有歌词,也不给错歌的歌词</b>。
- *       检索词用 {@code 标题 - 歌手 - 专辑} 三段式;打分走 {@link LyricMatchScore},候选自带的
+ *   <li>否则先请求 QQ Mobile 搜索，失败后回退 Desktop 和旧接口，再在本地打分。
+ *       检索词依次缩短为标题/歌手/专辑、标题/歌手和标题；打分走 {@link LyricMatchScore},候选自带的
  *       {@code interval} 参与时长乘数——同名不同版本(原曲 vs Remix 差几十秒)就是靠这一项挡掉的;</li>
  *   <li>{@code music.musichallSong.PlayLyricInfo} 取回 lyric/trans/roma 三段密文,
  *       交给 {@link QrcCipher} 解密 + inflate;</li>
@@ -49,6 +45,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 final class QQQrcLyricService {
 
     private static final String SEARCH_ENDPOINT = "https://c.y.qq.com/soso/fcgi-bin/search_for_qq_cp";
+    private static final String MODERN_SEARCH_ENDPOINT = "https://u6.y.qq.com/cgi-bin/musicu.fcg";
+    private static final String SEARCH_MODULE = "music.search.SearchCgiService";
+    private static final String MOBILE_SEARCH_METHOD = "DoSearchForQQMusicMobile";
+    private static final String MOBILE_SEARCH_KEY = SEARCH_MODULE + "." + MOBILE_SEARCH_METHOD;
     private static final String LYRIC_ENDPOINT = "https://u.y.qq.com/cgi-bin/musicu.fcg";
     private static final String SEARCH_REFERER = "http://m.y.qq.com";
     private static final String LYRIC_REFERER = "https://y.qq.com/portal/player.html";
@@ -66,7 +66,7 @@ final class QQQrcLyricService {
     private static final int CACHE_CAPACITY = 64;
     private static final int BREAKER_FAILURE_THRESHOLD = 3;
     private static final long BREAKER_COOLDOWN_MILLIS = 5L * 60L * 1_000L;
-    private static final int SEARCH_PAGE_SIZE = 10;
+    private static final int SEARCH_PAGE_SIZE = 30;
     private static final String LYRIC_CONTENT_MARKER = "LyricContent=\"";
 
     private static final Map<String, CacheEntry> CACHE = new ConcurrentHashMap<String, CacheEntry>();
@@ -271,34 +271,9 @@ final class QQQrcLyricService {
         if (title.isEmpty()) return null;
 
         LyricMatchScore.Target target = target(music);
-        // QQ 的 w 是整串关键词搜索,所以用「标题 - 歌手 - 专辑」三段式(缺哪段就少哪段)。
-        // 专辑进检索词不只是为了提高命中率:它让返回的候选倾向于是同一个版本。
-        JsonArray candidates = search(LyricMatchText.buildStructuredQuery(title, target.artist, target.album));
-        if (candidates == null || candidates.size() == 0) {
-            String withoutBrackets = LyricMatchText.dropBrackets(title);
-            if (!withoutBrackets.equals(title)) candidates = search(withoutBrackets);
-        }
-        if (candidates == null || candidates.size() == 0) return null;
-
-        JsonObject best = null;
-        LyricMatchScore.Result bestResult = null;
-        for (int i = 0; i < candidates.size(); i++) {
-            JsonElement element = candidates.get(i);
-            if (element == null || !element.isJsonObject()) continue;
-            JsonObject candidate = element.getAsJsonObject();
-            LyricMatchScore.Result result = LyricMatchScore.evaluate(target, candidate(candidate));
-            if (bestResult == null || result.score > bestResult.score) {
-                bestResult = result;
-                best = candidate;
-            }
-        }
-        if (best == null || bestResult == null) return null;
-        if (!bestResult.accepted()) {
-            System.out.println("[Music/QQ-QRC] " + music.getName() + " rejected every candidate (best "
-                    + bestResult.describe() + "), keeping platform lyrics");
-            return null;
-        }
-
+        JsonObject best = findCandidate(target, QQQrcLyricService::search);
+        if (best == null) return null;
+        LyricMatchScore.Result bestResult = LyricMatchScore.evaluate(target, candidate(best));
         long songId = numeric(text(best, "songid"));
         if (songId <= 0L) return null;
 
@@ -307,6 +282,46 @@ final class QQQrcLyricService {
         if (interval <= 0 && duration > 0L) interval = (int) (duration / 1000L);
         return fetchLyric(songId, text(best, "songname"), singerName(best), text(best, "albumname"), interval,
                 "search " + bestResult.describe() + " (songID=" + songId + ")");
+    }
+
+    /** Candidate search and identity checks are independent of lyric transport/decryption. */
+    static JsonObject findCandidate(LyricMatchScore.Target target,
+                                    java.util.function.Function<String, JsonArray> lookup) {
+        String title = target.title;
+        java.util.Set<String> queries = new java.util.LinkedHashSet<>();
+        String artist = target.artist.replace(", ", " ");
+        queries.add((title + " " + artist + " " + target.album).replace(" - ", " ").trim());
+        queries.add((title + " " + artist).replace(" - ", " ").trim());
+        String shortTitle = LyricMatchText.dropBrackets(title).replace(" - ", " ").trim();
+        queries.add((shortTitle + " " + artist).trim());
+        queries.add(shortTitle);
+        // Compact catalog album titles can overwhelm QQ's fuzzy search. Retry a smaller query,
+        // while retaining the original album/duration/performer checks for every candidate.
+        JsonObject best = null;
+        LyricMatchScore.Result bestResult = null;
+        for (String query : queries) {
+            if (Thread.currentThread().isInterrupted()) return null;
+            JsonArray candidates = lookup.apply(query);
+            if (candidates == null) continue;
+            for (JsonElement element : candidates) {
+                if (element == null || !element.isJsonObject()) continue;
+                JsonObject candidate = element.getAsJsonObject();
+                LyricMatchScore.Result result = LyricMatchScore.evaluate(target, candidate(candidate));
+                if (bestResult == null || result.score > bestResult.score) {
+                    bestResult = result;
+                    best = candidate;
+                }
+            }
+            if (bestResult != null && bestResult.accepted()) return best;
+        }
+        if (best == null || bestResult == null) return null;
+        if (!bestResult.accepted()) {
+            System.out.println("[Music/QQ-QRC] " + title + " rejected every candidate (best "
+                    + bestResult.describe() + "), keeping platform lyrics");
+            return null;
+        }
+
+        return best;
     }
 
     private static LyricMatchScore.Target target(Music music) {
@@ -335,6 +350,123 @@ final class QQQrcLyricService {
     }
 
     private static JsonArray search(String keyword, int limit) {
+        JsonArray modern = modernSearch(keyword, limit, true);
+        if (modern != null && !modern.isEmpty()) return modern;
+        modern = modernSearch(keyword, limit, false);
+        if (modern != null && !modern.isEmpty()) return modern;
+        return legacySearch(keyword, limit);
+    }
+
+    /** Mobile's grouped results include other recordings omitted from its top-level list. */
+    private static JsonArray modernSearch(String keyword, int limit, boolean mobile) {
+        if (Thread.currentThread().isInterrupted() || safe(keyword).trim().isEmpty()) return null;
+        JsonObject param = new JsonObject();
+        param.addProperty("query", keyword.trim());
+        param.addProperty("page_num", 1);
+        param.addProperty("num_per_page", Math.max(1, Math.min(limit, 50)));
+        param.addProperty("search_type", 0);
+        JsonObject body = new JsonObject();
+        if (mobile) {
+            JsonObject comm = new JsonObject();
+            comm.addProperty("ct", "11");
+            comm.addProperty("v", "20080508");
+            comm.addProperty("tmeLoginType", "0");
+            comm.addProperty("tmeLoginMethod", "0");
+            body.add("comm", comm);
+            param.addProperty("highlight", 1);
+            param.addProperty("searchid", "");
+            param.addProperty("sub_searchid", 0);
+            param.addProperty("nqc_flag", 0);
+            param.addProperty("sin", 0);
+            param.addProperty("ein", 30);
+            param.addProperty("cat", 2);
+            param.addProperty("grp", 1);
+            param.addProperty("remoteplace", "");
+            param.addProperty("from", "");
+            param.addProperty("multi_zhida", 1);
+            param.addProperty("sem", 0);
+            param.addProperty("related_data", "");
+            param.addProperty("ambi_data", "");
+        }
+        JsonObject request = new JsonObject();
+        request.addProperty("module", SEARCH_MODULE);
+        request.addProperty("method", mobile ? MOBILE_SEARCH_METHOD : "DoSearchForQQMusicDesktop");
+        request.add("param", param);
+        body.add(mobile ? MOBILE_SEARCH_KEY : "req_1", request);
+
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Content-Type", "application/x-www-form-urlencoded");
+        headers.put("Accept", "*/*");
+        headers.put("Referer", "https://c.y.qq.com/");
+        headers.put("User-Agent", mobile ? "QQMusic 20080508(android)" : DESKTOP_USER_AGENT);
+        try {
+            throttle();
+            try (InputStream stream = HttpUtils.request(MODERN_SEARCH_ENDPOINT, body.toString(), headers, "POST",
+                    "application/x-www-form-urlencoded", CONNECT_TIMEOUT_MILLIS, READ_TIMEOUT_MILLIS)) {
+                JsonArray result = stream == null ? null
+                        : parseSearchResponse(JsonUtils.toJsonObject(HttpUtils.readString(stream)));
+                if (result == null) noteFailure("invalid QQ search response");
+                else noteSuccess();
+                return result;
+            }
+        } catch (Exception failure) {
+            noteFailure(failure.getMessage());
+            return null;
+        }
+    }
+
+    static JsonArray parseSearchResponse(JsonObject root) {
+        if (root == null || intOf(root, "code") != 0) return null;
+        JsonObject response = objectOf(root, MOBILE_SEARCH_KEY);
+        if (response == null) response = objectOf(root, "req_1");
+        if (response == null || intOf(response, "code") != 0) return null;
+        JsonObject data = objectOf(response, "data");
+        if (data == null || intOf(data, "code") != 0) return null;
+        JsonObject body = objectOf(data, "body");
+        JsonArray rows = arrayOf(body, "item_song");
+        if (rows == null) rows = arrayOf(objectOf(body, "song"), "list");
+        if (rows == null) return null;
+        JsonArray result = new JsonArray();
+        appendSearchRows(rows, result, new java.util.HashSet<>(), 0);
+        return result;
+    }
+
+    private static void appendSearchRows(JsonArray rows, JsonArray result, java.util.Set<String> ids, int depth) {
+        if (rows == null || depth > 4) return;
+        for (JsonElement element : rows) {
+            if (!element.isJsonObject()) continue;
+            JsonObject raw = element.getAsJsonObject();
+            String id = text(raw, "id");
+            if (numeric(id) > 0L && ids.add(id)) {
+                JsonObject item = new JsonObject();
+                item.addProperty("songid", id);
+                item.addProperty("songmid", text(raw, "mid"));
+                item.addProperty("songname", searchTitle(raw));
+                JsonObject album = objectOf(raw, "album");
+                item.addProperty("albumname", searchTitle(album));
+                item.addProperty("albummid", text(album, "mid"));
+                item.addProperty("interval", intOf(raw, "interval"));
+                JsonArray singers = new JsonArray();
+                JsonArray originalSingers = arrayOf(raw, "singer");
+                if (originalSingers != null) for (JsonElement singer : originalSingers) {
+                    if (!singer.isJsonObject()) continue;
+                    JsonObject normalized = new JsonObject();
+                    normalized.addProperty("name", searchTitle(singer.getAsJsonObject()));
+                    singers.add(normalized);
+                }
+                item.add("singer", singers);
+                result.add(item);
+            }
+            appendSearchRows(arrayOf(raw, "grp"), result, ids, depth + 1);
+        }
+    }
+
+    private static String searchTitle(JsonObject object) {
+        String title = text(object, "title");
+        return (title.isBlank() ? text(object, "name") : title).replace("<em>", "").replace("</em>", "");
+    }
+
+    private static JsonArray legacySearch(String keyword, int limit) {
         if (Thread.currentThread().isInterrupted()) return null;
         if (safe(keyword).trim().isEmpty()) return null;
         Map<String, String> params = new LinkedHashMap<String, String>();

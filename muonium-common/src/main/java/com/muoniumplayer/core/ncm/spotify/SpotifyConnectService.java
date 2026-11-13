@@ -117,13 +117,20 @@ public final class SpotifyConnectService {
      * 401/429/403 由 {@link SpotifyWebApiClient} 的管线如实抛出。
      */
     public static PlaybackState fetchPlayback() throws IOException {
+        if (usesSoloist("")) {
+            return SpotifySoloistService.playback();
+        }
         Map<String, String> query = new LinkedHashMap<>();
-        query.put("additional_types", "track");
+        query.put("additional_types", "track,episode");
         return parsePlayback(SpotifyWebApiClient.getJson("/me/player", query));
     }
 
     /** 读设备列表。空列表 = 没有任何 Spotify 设备在线。 */
     public static List<Device> fetchDevices() throws IOException {
+        if (usesSoloist("")) {
+            return Collections.singletonList(new Device("soloist", SpotifySoloistService.DEVICE_NAME,
+                    "Computer", -1, true, true));
+        }
         return parseDevices(SpotifyWebApiClient.getJson("/me/player/devices", null));
     }
 
@@ -135,9 +142,7 @@ public final class SpotifyConnectService {
         JsonObject item = object(payload, "item");
         SpotifyMusicService.Track track = null;
         long durationMs = 0L;
-        // 播客/电台的 item 不是 track 形状（没有 artists/album），readTrack 会映射出残行 ——
-        // 直接不映射：镜像继续遥控传输，但「正在播放」不换行。
-        if (item != null && "track".equals(text(item, "type"))) {
+        if (item != null && ("track".equals(text(item, "type")) || "episode".equals(text(item, "type")))) {
             track = SpotifyMusicService.readTrack(item);
         }
         if (track != null) durationMs = track.durationMillis;
@@ -172,6 +177,11 @@ public final class SpotifyConnectService {
 
     /** 把播放转移到某台设备。{@code play} 决定转移过去之后是否接着放。 */
     public static void transfer(String deviceId, boolean play) throws IOException {
+        if ("soloist".equals(deviceId)) {
+            SpotifySoloistService.send("activate");
+            if (play) SpotifySoloistService.send("play");
+            return;
+        }
         JsonObject body = new JsonObject();
         JsonArray ids = new JsonArray();
         ids.add(deviceId == null ? "" : deviceId.trim());
@@ -182,28 +192,34 @@ public final class SpotifyConnectService {
 
     /** 恢复当前上下文的播放（不指定曲目，Spotify 自己接着上次的地方放）。 */
     public static void resume(String deviceId) throws IOException {
+        if (usesSoloist(deviceId)) { SpotifySoloistService.send("play"); return; }
         SpotifyWebApiClient.put("/me/player/play", deviceQuery(deviceId));
     }
 
     public static void pause(String deviceId) throws IOException {
+        if (usesSoloist(deviceId)) { SpotifySoloistService.send("pause"); return; }
         SpotifyWebApiClient.put("/me/player/pause", deviceQuery(deviceId));
     }
 
     public static void next(String deviceId) throws IOException {
+        if (usesSoloist(deviceId)) { SpotifySoloistService.send("skip_next"); return; }
         SpotifyWebApiClient.post("/me/player/next", deviceQuery(deviceId));
     }
 
     public static void previous(String deviceId) throws IOException {
+        if (usesSoloist(deviceId)) { SpotifySoloistService.send("skip_prev"); return; }
         SpotifyWebApiClient.post("/me/player/previous", deviceQuery(deviceId));
     }
 
     public static void seek(long positionMs, String deviceId) throws IOException {
+        if (usesSoloist(deviceId)) { SpotifySoloistService.seek(positionMs); return; }
         Map<String, String> query = deviceQuery(deviceId);
         query.put("position_ms", String.valueOf(Math.max(0L, positionMs)));
         SpotifyWebApiClient.put("/me/player/seek", query);
     }
 
     public static void setVolume(int percent, String deviceId) throws IOException {
+        if (usesSoloist(deviceId)) { SpotifySoloistService.volume(percent); return; }
         Map<String, String> query = deviceQuery(deviceId);
         query.put("volume_percent", String.valueOf(Math.max(0, Math.min(100, percent))));
         SpotifyWebApiClient.put("/me/player/volume", query);
@@ -225,6 +241,12 @@ public final class SpotifyConnectService {
         Map<String, String> query = new LinkedHashMap<>();
         if (deviceId != null && !deviceId.trim().isEmpty()) query.put("device_id", deviceId.trim());
         return query;
+    }
+
+    private static boolean usesSoloist(String deviceId) {
+        return "soloist".equals(deviceId) || ((deviceId == null || deviceId.isEmpty())
+                && SpotifySoloistService.isPaired()
+                && (SpotifyConnectMirror.isSoloist() || !SpotifyAuthStore.isLoggedIn() || SpotifyDesktopCatalog.usesDesktopSession()));
     }
 
     // ── 两处使用方共享的最近快照 ──────────────────────────────────────────────
@@ -258,7 +280,16 @@ public final class SpotifyConnectService {
      * 回调在后台线程执行，UI 调用方要自己切回主线程。
      */
     public static void refreshAsync(Runnable callback) {
-        if (!SpotifyMusicService.isLoggedIn()) {
+        if (usesSoloist("")) {
+            lastPlayback = SpotifySoloistService.playback();
+            synchronized (DEVICES_LOCK) {
+                lastDevices = Collections.singletonList(new Device("soloist", SpotifySoloistService.DEVICE_NAME,
+                        "Computer", lastPlayback == null ? -1 : lastPlayback.volumePercent, true, true));
+            }
+            if (callback != null) callback.run();
+            return;
+        }
+        if (!SpotifyAuthStore.isLoggedIn()) {
             lastPlayback = null;
             synchronized (DEVICES_LOCK) {
                 lastDevices = Collections.emptyList();

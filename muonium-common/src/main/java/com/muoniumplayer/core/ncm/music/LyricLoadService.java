@@ -85,17 +85,27 @@ final class LyricLoadService {
         final String cacheKey = cacheKey(trackKey);
 
         List<LyricLine> cached = LyricCacheStore.load(cacheKey);
-        if (!cached.isEmpty()) {
+        if (canReuseCachedLyrics(music.isSpotify(), LyricSourceMemory.read(trackKey),
+                firstReadablePin(music, trackKey) != null, cached)) {
             System.out.println("[Music/Cache] Loaded lyrics from disk cache for " + trackKey);
             return new LyricLoadResult(new JsonObject(), cached);
         }
 
-        LyricLoadResult result = resolve(music, songId, profileId, embeddedLyricFile);
+        LyricLoadResult result = resolve(music, songId, profileId, embeddedLyricFile).orCached(cached);
         if (result.lines != null && !result.lines.isEmpty()) {
             markChorus(music, songId, result.lines);
             LyricCacheStore.store(cacheKey, result.lines);
         }
         return result;
+    }
+
+    static boolean canReuseCachedLyrics(boolean spotify, int source, boolean manuallyPinned,
+                                         List<LyricLine> lines) {
+        if (lines == null || lines.isEmpty()) return false;
+        // A transient QQ lookup failure must not turn a Spotify line fallback into a permanent
+        // preference. Source-local hit/miss caches still bound retries; manual choices remain exact.
+        return !spotify || manuallyPinned || source != LyricSourceMemory.AUTO
+                || LyricParser.hasRealWordTiming(lines);
     }
 
     /** 缓存键：歌曲稳定键 + 影响解析结果的用户开关 + 这首歌指定的来源 + 手动钉住的那一条。 */
@@ -302,9 +312,9 @@ final class LyricLoadService {
         }
 
         // ── 1.7) Apple 自己的 TTML 歌词 ────────────────────────────────────────
-        // 与 YouTube 早段同一哲学：Apple 行的 catalog id 精确对应一条官方逐词时间轴，
+        // 与 YouTube 早段同一哲学：Apple 行的 catalog id 精确对应一条官方时间轴，
         // 拿 id 取词不存在「匹配错版本」的问题；AMLL 的按标题匹配只该给它兜空。
-        // 账号态（media-user-token）在时拿到的是逐词/逐音节版，游客态经常为空 ——
+        // 优先账号态的逐词/逐音节版；官方只有逐行也采用，游客态经常为空 ——
         // 空串按「这一源没有结果」处理，照常落到 AMLL 兜底，不挡链路。
         if (music.isApple()) {
             LyricLoadResult apple = appleTtmlLyrics(music);
@@ -379,6 +389,18 @@ final class LyricLoadService {
             if (LyricParser.hasWordByWordTiming(wordByWord.lines)) {
                 SERVED.put(trackKey, wordByWord.source);
                 return new LyricLoadResult(rawJson, wordByWord.lines);
+            }
+        }
+
+        // Spotify 的官方行级时间轴按精确 track ID 获取。优先保留逐字源；无词时继续下方回退。
+        if (music.isSpotify()) {
+            List<LyricLine> spotify = com.muoniumplayer.core.ncm.spotify.SpotifyLyricsService
+                    .resolve(music.getSourceId());
+            if (!spotify.isEmpty()) {
+                System.out.println("[Music/Spotify] Loaded official lyrics (" + spotify.size()
+                        + " 行) for " + trackKey);
+                SERVED.put(trackKey, LyricSourceMemory.PLATFORM);
+                return new LyricLoadResult(createEmbeddedLyricJson(""), spotify);
             }
         }
 
@@ -573,10 +595,9 @@ final class LyricLoadService {
     /**
      * Apple 官方 TTML → 共享时间轴。
      *
-     * <p>解析走 {@code LyricParser.parseTtml}（AMLL 同一条路），返回前用
-     * {@code hasWordByWordTiming} 自检：Apple 游客态经常只给行级甚至空串，行级 TTML
-     * 不算数 —— 按 null 处理，照常落到 AMLL 兜底，绝不拿一份没有逐字的时间轴去喂
-     * 逐词渲染器。缓存 JSON 直接包 TTML 原文，与内嵌歌词同一形态。</p>
+     * <p>解析走 {@code LyricParser.parseTtml}（AMLL 同一条路）。官方只有逐行时仍保留
+     * 有效时间轴；逐行、逐字能力由解析后的词时间自然区分，不能因缺少逐字而丢掉歌词。
+     * 缓存 JSON 直接包 TTML 原文，与内嵌歌词同一形态。</p>
      */
     private static LyricLoadResult appleTtmlLyrics(Music music) {
         String songId = music.getSourceId();
@@ -586,7 +607,7 @@ final class LyricLoadService {
             if (ttml == null || ttml.trim().isEmpty()) return null;
             List<LyricLine> parsed = new ArrayList<>();
             LyricParser.parseTtml(ttml, parsed);
-            if (!LyricParser.hasWordByWordTiming(parsed)) return null;
+            if (parsed.isEmpty()) return null;
             System.out.println("[Music/Apple] 官方 TTML 歌词 " + parsed.size() + " 行 for "
                     + music.getStableKey());
             return new LyricLoadResult(createEmbeddedLyricJson(ttml), parsed);
@@ -766,6 +787,12 @@ final class LyricLoadService {
         /** 加载彻底失败时的空结果：调用方仍然要提交一次，好让歌词时间轴的归属推进到当前歌曲。 */
         static LyricLoadResult empty() {
             return new LyricLoadResult(new JsonObject(), Collections.<LyricLine>emptyList());
+        }
+
+        LyricLoadResult orCached(List<LyricLine> cached) {
+            // Retry automatic line fallbacks, but keep readable cached lyrics when all sources fail.
+            return (lines == null || lines.isEmpty()) && cached != null && !cached.isEmpty()
+                    ? new LyricLoadResult(new JsonObject(), cached) : this;
         }
     }
 }

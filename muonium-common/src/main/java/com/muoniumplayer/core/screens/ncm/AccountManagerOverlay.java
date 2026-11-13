@@ -223,8 +223,6 @@ public class AccountManagerOverlay extends NcmSheet {
     /** 方格之间的间距：与音源浮层总览同一档，hover 生长每侧 2px 不会互压圆角。 */
     private static final double OVERVIEW_GAP = 10.0;
     /** 下一行比上一行少一格：第二行的格子整体居中，两行共一根中轴。 */
-    private static final int[] OVERVIEW_ROW_CELLS = {3, 2};
-
     private void showOverview() {
         pageGeneration.incrementAndGet();
         detailPlatform = null;
@@ -240,12 +238,10 @@ public class AccountManagerOverlay extends NcmSheet {
         final ScrollPanel feed = feed(body);
         // 开头让出几像素：格子悬停时绕着自己中心长，第一行贴着滚动区上边的话会被硬裁切掉圆角。
         strip(feed, LEAD);
-        // 3 + 2 + 1 三行：Apple 加入后六个平台凑成 3-2-1 的阶梯（下一行收一列整体居中，
-        // 两两共用一根中轴，视觉上仍是对称的）—— 与其硬凑 3×2 的满格矩阵留两个窟窿，
-        // 不如让每行都比上一行少一格，收尾自然。
+        // Spotify 与 Apple 都从账号总览提供独立登录入口。
         final MusicPlatform[][] rows = {
                 {MusicPlatform.NETEASE, MusicPlatform.QQ, MusicPlatform.KUGOU},
-                {MusicPlatform.QISHUI, MusicPlatform.BILIBILI},
+                {MusicPlatform.QISHUI, MusicPlatform.BILIBILI, MusicPlatform.SPOTIFY},
                 {MusicPlatform.APPLE}};
         int slot = 0;
         for (int r = 0; r < rows.length; r++) {
@@ -279,8 +275,8 @@ public class AccountManagerOverlay extends NcmSheet {
                 slot++;
             }
         }
-        // YouTube 与 Spotify 不在这里：它们的登录不是扫码 / Cookie 导入，各自的登录页
-        // 挂在音源浮层（MusicSourceOverlay）自己的卡上。Apple 虽然也是 cookies 形态，
+        // YouTube 不在这里：它的浏览器 Cookie 登录页仍挂在音源浮层。Spotify 卡片直达 OAuth 登录页。
+        // Apple 虽然也是 cookies 形态，
         // 但它有独立的登录页（gamdl 整包状态 + cookies 导入 + 播放偏好），进这边的
         // 详情页统一管理。
 
@@ -328,6 +324,13 @@ public class AccountManagerOverlay extends NcmSheet {
         card.setShouldOverrideMouseCursor(true);
         card.setOnClickCallback((x, y, button) -> {
             if (button != 0) return false;
+            if (platform == MusicPlatform.SPOTIFY) {
+                dispose();
+                NCMScreen screen = NCMScreen.getInstance();
+                screen.openMusicSourceManager();
+                screen.musicSourceOverlay.openSpotifyLogin();
+                return true;
+            }
             showDetail(platform);
             return true;
         });

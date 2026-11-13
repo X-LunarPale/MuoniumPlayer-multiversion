@@ -245,12 +245,8 @@ public final class AppleMusicService {
     // ── 歌词 / 试听 ─────────────────────────────────────────────────────────
 
     /**
-     * 拉一首歌的 TTML 歌词（逐词/逐音节，Apple 官方形态）。助手优先（TLS 指纹），
-     * 直连降级同 {@link #search}。
-     *
-     * <p>账号态（media-user-token）在时拿到的是逐词版；游客态经常拿不到 {@code ttml}
-     * 字段，返回空串由调用方落到 AMLL DB 兜底。返回原始 TTML 字符串，由
-     * {@code LyricParser.parseTtml} 统一进时间轴。</p>
+     * 按歌曲 id 取官方 TTML：登录时带账号头，优先本地化逐音节版，其次官方逐行版。
+     * 无歌词时返回 null，由调用方继续尝试其他歌词源。
      */
     public static String ttml(String songId) {
         String id = songId == null ? "" : songId.trim();
@@ -258,32 +254,43 @@ public final class AppleMusicService {
         return viaTransport(() -> {
             try {
                 Map<String, String> query = new LinkedHashMap<>();
-                query.put("extend", "extendedAssetUrls");
-                query.put("include", "lyrics");
-                JsonObject payload = AppleApiClient.getCatalog(
-                        catalogPath("/catalog/" + AppleConfigStore.storefront() + "/songs/" + id, query));
+                boolean account = AppleConfigStore.snapshot().loggedIn();
+                query.put("include[songs]", account ? "syllable-lyrics,lyrics" : "lyrics");
+                query.put("extend", "ttmlLocalizations");
+                query.put("l", "zh-Hans-CN");
+                String path = catalogPath("/v1/catalog/" + AppleConfigStore.storefront()
+                        + "/songs/" + id, query);
+                JsonObject payload = account ? AppleApiClient.getAccount(path)
+                        : AppleApiClient.getCatalog(path);
                 JsonArray data = payload.getAsJsonArray("data");
                 if (data == null || data.size() == 0) return null;
                 JsonObject relationships = data.get(0).getAsJsonObject().getAsJsonObject("relationships");
                 if (relationships == null) return null;
-                JsonArray lyrics = relationships.getAsJsonArray("lyrics");
-                if (lyrics == null) return null;
-                JsonObject lyricsRelation = lyrics.size() > 0 ? lyrics.get(0).getAsJsonObject() : null;
-                JsonArray lyricData = lyricsRelation == null ? null
-                        : lyricsRelation.getAsJsonArray("data");
-                if (lyricData == null) return null;
-                for (JsonElement element : lyricData) {
-                    if (element == null || !element.isJsonObject()) continue;
-                    JsonObject attributes = element.getAsJsonObject().getAsJsonObject("attributes");
-                    String ttml = attributes == null ? "" : text(attributes, "ttml");
-                    if (!ttml.isEmpty()) return ttml;
-                }
-                return null;
+                String syllables = ttmlOfRelationship(relationships, "syllable-lyrics");
+                return syllables != null ? syllables : ttmlOfRelationship(relationships, "lyrics");
             } catch (IOException | AppleApiClient.AppleApiException throwable) {
                 System.err.println("[Music/Apple] Java 歌词失败: " + throwable.getMessage());
                 return null;
             }
         });
+    }
+
+    private static String ttmlOfRelationship(JsonObject relationships, String type) {
+        JsonElement relation = relationships.get(type);
+        if (relation == null || !relation.isJsonObject()) return null;
+        JsonElement resources = relation.getAsJsonObject().get("data");
+        if (resources == null || !resources.isJsonArray()) return null;
+        for (JsonElement resource : resources.getAsJsonArray()) {
+            if (!resource.isJsonObject()) continue;
+            JsonElement attributes = resource.getAsJsonObject().get("attributes");
+            if (attributes == null || !attributes.isJsonObject()) continue;
+            for (String key : List.of("ttmlLocalizations", "ttml")) {
+                JsonElement value = attributes.getAsJsonObject().get(key);
+                if (value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString()
+                        && !value.getAsString().trim().isEmpty()) return value.getAsString();
+            }
+        }
+        return null;
     }
 
     /** 单曲详情：preview 兜底播放要的 30 秒试听地址。助手优先，拿不到返回空串。 */

@@ -740,7 +740,8 @@ public final class WorldBillboard implements WorldLyricsRenderer.Host {
         // 挂起批次自检：本槽纹理的 quad 还在缓冲里没收批时，必须先收掉再
         // 改写/释放纹理 —— 否则同帧双拖尾行时后行像素覆盖前行 quad（同尺寸）、
         // 或 release 后挂起 quad 引用已删纹理画出缺失纹理（变尺寸）
-        if (pendingEffectRl == rl && buffers != null) {
+        // 首次使用本槽时 rl 与 pendingEffectRl 都可能为空，空槽没有可提交批次。
+        if (rl != null && pendingEffectRl == rl && buffers != null) {
             buffers.endBatch(currentGlyphType(rl));
             pendingEffectRl = null;
         }

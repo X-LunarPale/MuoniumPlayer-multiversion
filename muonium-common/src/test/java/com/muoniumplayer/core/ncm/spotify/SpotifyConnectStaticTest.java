@@ -24,6 +24,26 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class SpotifyConnectStaticTest {
 
+    @Test
+    void developerCatalogAndPlaybackExplicitlyIncludeEpisodes() throws IOException {
+        login();
+        FakeTransport transport = new FakeTransport();
+        SpotifyWebApiClient.setTransportForTest(transport);
+        transport.enqueue(200, "{\"items\":[]}");
+        SpotifyMusicService.playlistTracks("episode-list", 100);
+        transport.enqueue(404, "{}");
+        transport.enqueue(200, "{\"items\":[]}");
+        SpotifyMusicService.playlistTracks("legacy-episode-list", 100);
+        transport.enqueue(204, "");
+        SpotifyConnectService.fetchPlayback();
+        assertEquals(4, transport.apiCalls().size());
+        for (var request : transport.apiCalls()) {
+            String url = java.net.URLDecoder.decode(request.url, java.nio.charset.StandardCharsets.UTF_8);
+            assertTrue(url.contains("additional_types=track,episode"), url);
+            if (url.contains("/playlists/")) assertTrue(url.contains("limit=50"), url);
+        }
+    }
+
     /** 可编程 transport：记录每次收到的请求，按序弹脚本响应；脚本耗尽时一律回 204。 */
     private static final class FakeTransport implements SpotifyWebApiClient.Transport {
         final List<SpotifyWebApiClient.Request> seen =
@@ -118,7 +138,7 @@ class SpotifyConnectStaticTest {
     }
 
     @Test
-    @DisplayName("parsePlayback：暂停时不外推；播客条目不映射成曲目行")
+    @DisplayName("parsePlayback：暂停时不外推；播客条目保留独立播放身份")
     void parsePlaybackPausedAndNonTrack() {
         SpotifyConnectService.PlaybackState paused = SpotifyConnectService.parsePlayback(
                 JsonParser.parseString("{\"device\":{\"id\":\"d1\",\"name\":\"PC\"},"
@@ -135,9 +155,10 @@ class SpotifyConnectStaticTest {
                         + "\"item\":{\"type\":\"episode\",\"id\":\"e1\",\"name\":\"播客\","
                         + "\"duration_ms\":900000}}").getAsJsonObject());
         assertNotNull(podcast);
-        assertNull(podcast.track, "episode 不是曲目：镜像不换「正在播放」行");
-        assertEquals(0L, podcast.durationMs);
-        assertEquals("", podcast.trackKey());
+        assertNotNull(podcast.track);
+        assertEquals("episode:e1", podcast.track.id);
+        assertEquals(900000L, podcast.durationMs);
+        assertEquals("spotify:episode:e1", podcast.trackKey());
     }
 
     @Test

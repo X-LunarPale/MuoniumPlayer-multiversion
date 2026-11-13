@@ -25,6 +25,10 @@ import java.util.List;
  */
 public final class WorldLyricsRenderer {
 
+    private static final org.apache.logging.log4j.Logger LOGGER =
+            org.apache.logging.log4j.LogManager.getLogger("MuoniumPlayer/WorldLyrics");
+    private static String lastDiagnosticTrackKey;
+
     /** 诊断开关（与树侧同一个 -D 属性）。trace 每帧最多一行，避免刷爆日志。 */
     static final boolean TRACE = Boolean.getBoolean("muonium.debug.worldLyrics");
     private static long lastTraceNanos;
@@ -248,11 +252,11 @@ public final class WorldLyricsRenderer {
             consecutiveFailures = 0;
         } catch (Throwable t) {
             if (consecutiveFailures == 0) {
-                System.out.println("[MuoniumPlayer/WorldLyrics] 渲染失败，本帧跳过: " + t);
+                LOGGER.error("3D 歌词渲染失败，本帧跳过", t);
             }
             consecutiveFailures++;
             if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-                System.out.println("[MuoniumPlayer/WorldLyrics] 连续 " + consecutiveFailures
+                LOGGER.error("[MuoniumPlayer/WorldLyrics] 连续 " + consecutiveFailures
                         + " 帧渲染失败，整体停用（重启游戏恢复）");
                 consecutiveFailures = 0;
                 broken = true;
@@ -284,6 +288,14 @@ public final class WorldLyricsRenderer {
                 com.muoniumplayer.core.ncm.music.CloudMusic.getSnapshot();
         WorldLyricsState.Frame frame = state.update(camera, settings, nowNanos,
                 snap.playing, snap.positionMs);
+        String diagnosticKey = com.muoniumplayer.core.ncm.music.CloudMusic.lyricsTrackKey;
+        if (!java.util.Objects.equals(lastDiagnosticTrackKey, diagnosticKey)) {
+            lastDiagnosticTrackKey = diagnosticKey;
+            LOGGER.info("3D 歌词已进入绘制：track={} playing={} positionMs={} lines={} rows={} modern={}",
+                    diagnosticKey, snap.playing, snap.positionMs,
+                    com.muoniumplayer.core.ncm.music.CloudMusic.lyrics.size(),
+                    frame == null ? 0 : frame.rows.size(), settings.styleModern);
+        }
         if (frame == null || frame.rows.isEmpty()) {
             if (TRACE && !traceThrottled()) {
                 System.out.println("[WorldLyrics/trace] hasLyrics=true 但本帧无行可画"

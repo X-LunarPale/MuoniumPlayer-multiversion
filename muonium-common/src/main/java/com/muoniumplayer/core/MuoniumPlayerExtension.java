@@ -67,6 +67,7 @@ public class MuoniumPlayerExtension {
         com.muoniumplayer.core.ncm.lxsource.ClosureCompilerDownload.ensureDownload();
         CloudMusic.quality = NCMPlayerConfig.getAudioQuality();
         MultiThreadingUtil.runAsync(CloudMusic::initNCM);
+        com.muoniumplayer.core.ncm.spotify.SpotifySoloistService.restoreSavedSession();
         // 汽水签名后端:装了伴生包就随游戏隐藏拉起(独立进程,游戏退出自动收掉);
         // 还没装则不惊动,首次点进汽水源时按需下载伴生包。
         QishuiBackendLifecycle.ensureStartedForGame();

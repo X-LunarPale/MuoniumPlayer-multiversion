@@ -236,11 +236,11 @@ public class PlayList {
                 }
             } else if (getPlatform() == MusicPlatform.SPOTIFY) {
                 // Spotify 的 platformPlaylistId 有三种形状：裸 base62 是歌单、"liked" 是喜欢的歌
-                // 虚拟单、"album:<id>" 是专辑——由服务层按形状分派。行是元数据行，播放由
-                // 换源流水线在其余平台找替身。
+                // 虚拟单、"album:<id>" 是专辑——由服务层按形状分派。卡片计数可能缺失或过期，
+                // 取全量时按服务端分页结果结束，不能把默认的 100 当成整张歌单的上限。
                 List<com.muoniumplayer.core.ncm.spotify.SpotifyMusicService.Track> spotifyTracks =
                         com.muoniumplayer.core.ncm.spotify.SpotifyMusicService
-                                .playlistTracks(getPlatformPlaylistId(), Math.max(100, count > 0 ? count : 100));
+                                .playlistTracks(getPlatformPlaylistId(), 20000);
                 if (spotifyTracks == null) {
                     throw new IllegalStateException("Spotify playlist track response is null");
                 }
@@ -264,9 +264,11 @@ public class PlayList {
                     loadedMusics = new ArrayList<>(com.muoniumplayer.core.ncm.apple.chart.AppleChartsService
                             .chartTracks(chartSf));
                 } else {
+                // 卡片曲数可能缺失或过期，不能把默认 100 当成整张歌单的上限。
+                // 与 Spotify 一样给全量加载留足预算，分页结束由服务层判断。
                 List<com.muoniumplayer.core.ncm.apple.AppleMusicService.Track> appleTracks =
                         com.muoniumplayer.core.ncm.apple.AppleMusicService
-                                .playlistTracks(getPlatformPlaylistId(), Math.max(100, count > 0 ? count : 100));
+                                .playlistTracks(getPlatformPlaylistId(), 20000);
                 if (appleTracks == null) {
                     throw new IllegalStateException("Apple playlist track response is null");
                 }

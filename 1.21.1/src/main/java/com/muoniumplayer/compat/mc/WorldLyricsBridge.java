@@ -8,8 +8,8 @@ import com.muoniumplayer.core.lyrics3d.WorldLyricsRenderer;
 import com.muoniumplayer.core.lyrics3d.WorldLyricsSettings;
 import com.muoniumplayer.core.lyrics3d.WorldLyricsState;
 import com.muoniumplayer.core.settings.HudConfig;
-import com.muoniumplayer.core.utils.logging.LogManager;
-import com.muoniumplayer.core.utils.logging.Logger;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Camera;

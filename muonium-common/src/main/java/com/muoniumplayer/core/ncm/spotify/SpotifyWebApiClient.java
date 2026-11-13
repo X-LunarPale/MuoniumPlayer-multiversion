@@ -127,6 +127,26 @@ public final class SpotifyWebApiClient {
         return requestWithAuth("GET", SpotifyConfigStore.API_BASE + path, query, null, null, 0);
     }
 
+    /** Fixed Spotify desktop endpoints; credentials are never sent to caller-supplied hosts. */
+    static JsonObject desktopQuery(JsonObject body) throws IOException {
+        JsonObject response = requestWithAuth("POST", "https://api-partner.spotify.com/pathfinder/v2/query",
+                null, null, body.toString(), 0);
+        if (response.has("errors") && response.get("errors").isJsonArray()
+                && response.getAsJsonArray("errors").size() > 0) {
+            throw new IOException("Spotify 曲库查询被拒绝，请重新授权或稍后刷新");
+        }
+        if (!response.has("data") || !response.get("data").isJsonObject()) {
+            throw new IOException("Spotify 曲库响应缺少 data");
+        }
+        return response.getAsJsonObject("data");
+    }
+
+    static JsonObject lyrics(String id) throws IOException {
+        if (id == null || !id.matches("[0-9A-Za-z]{22}")) throw new IllegalArgumentException("track id");
+        return requestWithAuth("GET", "https://spclient.wg.spotify.com/color-lyrics/v2/track/" + id,
+                Map.of("format", "json", "vocalRemoval", "false", "market", "from_token"), null, null, 0);
+    }
+
     /**
      * 带 Bearer 的 PUT（Spotify Connect 的转移/播放/暂停/seek/音量都是 PUT）。
      * {@code jsonBody} 为 null 时发一个 {@code Content-Length: 0} 的空体。
@@ -164,38 +184,54 @@ public final class SpotifyWebApiClient {
     private static JsonObject requestWithAuth(String method, String url,
                                               Map<String, String> query, String formBody,
                                               String jsonBody, int attempt) throws IOException {
+        return requestWithAuth(method, url, query, formBody, jsonBody, attempt, SpotifyAuthStore.snapshot().generation);
+    }
+
+    private static JsonObject requestWithAuth(String method, String url,
+                                              Map<String, String> query, String formBody,
+                                              String jsonBody, int attempt, long generation) throws IOException {
         SpotifyAuthStore.Session session = SpotifyAuthStore.snapshot();
+        SpotifyAuthStore.checkGeneration(generation);
         if (session.isReauthRequired() && !session.tokenReady()) {
             throw new SpotifyApiException(0, "REAUTH_REQUIRED", true);
         }
         String token = currentAccessToken(session);
         Map<String, String> headers = new LinkedHashMap<>();
         headers.put("Authorization", "Bearer " + token);
+        headers.put("Accept", "application/json");
+        headers.put("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
+        // Desktop endpoints reject the default Java agent with "Client/request not allowed".
+        headers.put("User-Agent", "Mozilla/5.0 MuoniumPlayer");
+        // color-lyrics requires a platform identity, including when replayed after a refresh/retry.
+        if (url.startsWith("https://spclient.wg.spotify.com/color-lyrics/v2/track/")) {
+            headers.put("app-platform", "WebPlayer");
+        }
         String urlWithQuery = appendQuery(url, query);
 
         Response response = transport().send(new Request(urlWithQuery, method, headers,
                 formBody, jsonBody));
+        SpotifyAuthStore.checkGeneration(generation);
 
         if (response.code == 401) {
             // access token 失效（过期/被轮换/远端吊销）。强制刷新一次再重放；
             // 重放仍 401 就不是「该刷新了」而是凭据已死，转重新授权。
             if (attempt == 0) {
-                invalidateAccessToken();
-                return requestWithAuth(method, url, query, formBody, jsonBody, attempt + 1);
+                SpotifyAuthStore.invalidateAccessToken(generation);
+                return requestWithAuth(method, url, query, formBody, jsonBody, attempt + 1, generation);
             }
-            SpotifyAuthStore.markReauthRequired();
+            SpotifyAuthStore.markReauthRequired(generation);
             throw new SpotifyApiException(401, "REAUTH_REQUIRED", true);
         }
         if (response.code == 429 && attempt == 0) {
             long waitMillis = retryAfterMillis(response);
             if (waitMillis >= 0 && waitMillis <= MAX_RETRY_AFTER_MILLIS) {
                 sleepQuietly(waitMillis + 250L);
-                return requestWithAuth(method, url, query, formBody, jsonBody, attempt + 1);
+                return requestWithAuth(method, url, query, formBody, jsonBody, attempt + 1, generation);
             }
         }
         if (response.code >= 500 && attempt == 0) {
             sleepQuietly(400L);
-            return requestWithAuth(method, url, query, formBody, jsonBody, attempt + 1);
+            return requestWithAuth(method, url, query, formBody, jsonBody, attempt + 1, generation);
         }
 
         JsonObject payload = parseBody(response);
@@ -219,18 +255,14 @@ public final class SpotifyWebApiClient {
         }
         synchronized (REFRESH_LOCK) {
             SpotifyAuthStore.Session latest = SpotifyAuthStore.snapshot();
+            SpotifyAuthStore.checkGeneration(session.generation);
             if (latest.tokenReady()) return latest.accessToken;
             if (!latest.canRefresh()) {
                 throw new SpotifyApiException(0, "NOT_LOGGED_IN", latest.isReauthRequired());
             }
-            refreshTokens(latest.refreshToken);
+            refreshTokens(latest.refreshToken, latest.clientId, session.generation);
             return SpotifyAuthStore.snapshot().accessToken;
         }
-    }
-
-    /** 只把内存里的 access token 作废（401 重放前调），refresh token 不动。 */
-    private static void invalidateAccessToken() {
-        SpotifyAuthStore.saveRefreshedToken("", 0L, null);
     }
 
     /**
@@ -239,24 +271,25 @@ public final class SpotifyWebApiClient {
      * <p>Spotify 刷新成功时<b>可能不回新的 refresh_token</b>；{@link SpotifyAuthStore#saveTokenResponse}
      * 对缺席字段保留旧值，所以这里整份交给它落。</p>
      */
-    private static void refreshTokens(String refreshToken) throws IOException {
+    private static void refreshTokens(String refreshToken, String clientId, long generation) throws IOException {
         Map<String, String> form = new LinkedHashMap<>();
         form.put("grant_type", "refresh_token");
         form.put("refresh_token", refreshToken);
-        form.put("client_id", SpotifyConfigStore.clientId());
+        form.put("client_id", clientId);
         Response response = sendWithBoundedRetry(new Request(
                 SpotifyConfigStore.ACCOUNTS_BASE + SpotifyConfigStore.TOKEN_PATH, "POST",
                 new LinkedHashMap<>(), formBody(form)), 0);
+        SpotifyAuthStore.checkGeneration(generation);
         JsonObject payload = parseBody(response);
         if (response.code < 200 || response.code >= 300) {
             String reason = errorReason(payload, response.code);
             if ("invalid_grant".equals(reason)) {
-                SpotifyAuthStore.markReauthRequired();
+                SpotifyAuthStore.markReauthRequired(generation);
                 throw new SpotifyApiException(response.code, "REAUTH_REQUIRED", true);
             }
             throw new SpotifyApiException(response.code, reason, false);
         }
-        SpotifyAuthStore.saveTokenResponse(payload);
+        SpotifyAuthStore.saveTokenResponse(payload, generation);
     }
 
     /** 429 / 5xx 的有界重试（最多一次）在 form 端点也要有：token 服务一样会抖。 */

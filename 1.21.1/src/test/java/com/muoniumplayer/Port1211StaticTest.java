@@ -45,6 +45,24 @@ class Port1211StaticTest {
             ProjectPaths.sourceFile(Paths.get("com", "muoniumplayer", "render", "skija", "SkijaHost.java"));
 
     @Test
+    @DisplayName("3D 拖尾空纹理槽不能被当作待提交批次")
+    void emptyTrailTextureSlotMustNotFlush() throws IOException {
+        String src = read(ProjectPaths.versionJava().resolve(
+                "com/muoniumplayer/compat/mc/WorldBillboard.java"));
+        int draw = src.indexOf("private boolean drawTrailCanvas(");
+        int allocation = src.indexOf("        try {", draw);
+        assertTrue(draw >= 0 && allocation > draw, "必须定位拖尾纹理分配前的批次处理");
+        String beforeAllocation = src.substring(draw, allocation).replaceAll("\\s+", " ");
+        // 首帧 trailCanvasRl[slot] 与 pendingEffectRl 都是 null。
+        // 仅比较引用相等会把 null 传给 RenderType，游戏日志已复现 NPE。
+        assertTrue(beforeAllocation.contains(
+                        "if (rl != null && pendingEffectRl == rl && buffers != null) {"),
+                "提交旧批次前必须确认槽位已有纹理；不能把两个 null 当成同一待提交纹理");
+        assertTrue(beforeAllocation.contains("buffers.endBatch(currentGlyphType(rl));"),
+                "已有纹理的待提交批次仍须在纹理改写/释放前收批");
+    }
+
+    @Test
     @DisplayName("版本声明一致：1.21.1 / fabric-api / neoforge 21.1 / Java 21")
     void 版本声明一致() throws IOException {
         String props = read(ROOT.resolve("gradle.properties"));

@@ -155,6 +155,22 @@ class SpotifyWebApiClientStaticTest {
     }
 
     @Test
+    @DisplayName("刷新沿用签发当前 refresh token 的 Client ID，不受下一次登录模式影响")
+    void refreshUsesClientIdBoundToSession() throws IOException {
+        login(-1000L);
+        SpotifyConfigStore.saveLoginMode(SpotifyConfigStore.LoginMode.BROWSER);
+        transport = new FakeTransport();
+        transport.enqueue(200, "{\"access_token\":\"new-access\",\"expires_in\":3600}");
+        transport.enqueue(200, "{}");
+        SpotifyWebApiClient.setTransportForTest(transport);
+
+        SpotifyWebApiClient.getJson("/search", null);
+
+        assertTrue(transport.lastRefresh().formBody.contains("client_id=test-client-id"));
+        assertFalse(transport.lastRefresh().formBody.contains(SpotifyConfigStore.BROWSER_CLIENT_ID));
+    }
+
+    @Test
     @DisplayName("刷新端点回 invalid_grant：清 token、标记重新授权并抛出")
     void invalidGrantClearsTokensAndMarksReauth() {
         login(-1000L);

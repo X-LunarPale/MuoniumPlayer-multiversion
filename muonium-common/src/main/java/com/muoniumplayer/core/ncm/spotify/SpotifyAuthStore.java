@@ -31,14 +31,18 @@ public final class SpotifyAuthStore {
     private static boolean loaded;
     /** 静测模式：只活在内存里，绝不碰磁盘（测试进程的「当前目录」不是用户配置目录）。 */
     private static boolean diskless;
+    private static long authorizationGeneration;
 
     private SpotifyAuthStore() {
     }
 
     public static final class Session {
         public final boolean loggedIn;
+        public final long generation;
         public final String accessToken;
         public final String refreshToken;
+        /** 签发本会话的 OAuth 身份；切换下一次登录方式不改变现有刷新凭据的归属。 */
+        public final String clientId;
         /** token 声明的过期时刻（epoch 毫秒）；0 表示未知，按已过期处理。 */
         public final long expiresAt;
         public final String scope;
@@ -50,8 +54,11 @@ public final class SpotifyAuthStore {
         public final boolean reauthRequired;
 
         Session(Data source) {
+            this.generation = authorizationGeneration;
             this.accessToken = nonBlank(source.accessToken);
             this.refreshToken = nonBlank(source.refreshToken);
+            this.clientId = nonBlank(source.clientId).isEmpty()
+                    ? SpotifyConfigStore.clientId() : source.clientId;
             this.expiresAt = source.expiresAt;
             this.scope = nonBlank(source.scope);
             this.accountName = nonBlank(source.accountName);
@@ -107,6 +114,33 @@ public final class SpotifyAuthStore {
         return snapshot().loggedIn;
     }
 
+    static void checkGeneration(long expected) throws IOException {
+        synchronized (LOCK) {
+            if (expected != authorizationGeneration) throw new IOException("Spotify 账号已切换，本次请求已取消");
+        }
+    }
+
+    static void saveTokenResponse(JsonObject payload, long expected) throws IOException {
+        synchronized (LOCK) {
+            checkGeneration(expected);
+            saveTokenResponse(payload);
+        }
+    }
+
+    static void invalidateAccessToken(long expected) throws IOException {
+        synchronized (LOCK) {
+            checkGeneration(expected);
+            saveRefreshedToken("", 0L, null);
+        }
+    }
+
+    static void markReauthRequired(long expected) throws IOException {
+        synchronized (LOCK) {
+            checkGeneration(expected);
+            markReauthRequired();
+        }
+    }
+
     /**
      * 从 token 端点的响应落一份新凭据。
      *
@@ -131,6 +165,20 @@ public final class SpotifyAuthStore {
             data.authorizedAt = System.currentTimeMillis();
             data.updatedAt = System.currentTimeMillis();
             persistLocked();
+        }
+    }
+
+    /** 一次新授权替换整个旧会话，避免把上一个账号的 refresh token、scope 和资料带过去。 */
+    static void saveAuthorization(JsonObject payload, String clientId) {
+        if (payload == null || text(payload, "access_token").isEmpty()) {
+            throw new IllegalArgumentException("Spotify 没有返回 access_token");
+        }
+        synchronized (LOCK) {
+            ensureLoaded();
+            data = new Data();
+            data.clientId = clientId;
+            ++authorizationGeneration;
+            saveTokenResponse(payload);
         }
     }
 
@@ -189,6 +237,7 @@ public final class SpotifyAuthStore {
     /** 退出登录：清内存与磁盘上的凭据。与 {@link #markReauthRequired} 不同，这是用户主动要删。 */
     public static void clear() {
         synchronized (LOCK) {
+            ++authorizationGeneration;
             data = new Data();
             loaded = true;
             if (diskless) return;
@@ -204,10 +253,12 @@ public final class SpotifyAuthStore {
 
     static void putForTest(String accessToken, String refreshToken, long expiresAt) {
         synchronized (LOCK) {
+            ++authorizationGeneration;
             data = new Data();
             data.accessToken = accessToken == null ? "" : accessToken;
             data.refreshToken = refreshToken == null ? "" : refreshToken;
             data.expiresAt = expiresAt;
+            data.clientId = SpotifyConfigStore.clientId();
             loaded = true;
             diskless = true;
         }
@@ -215,6 +266,7 @@ public final class SpotifyAuthStore {
 
     static void clearForTest() {
         synchronized (LOCK) {
+            ++authorizationGeneration;
             data = new Data();
             loaded = true;
             diskless = true;
@@ -267,6 +319,7 @@ public final class SpotifyAuthStore {
     private static final class Data {
         String accessToken = "";
         String refreshToken = "";
+        String clientId = "";
         long expiresAt;
         String scope = "";
         String accountName = "";

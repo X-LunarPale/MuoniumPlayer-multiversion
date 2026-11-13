@@ -11,15 +11,9 @@ import java.util.Locale;
 import java.util.regex.Pattern;
 
 /**
- * Spotify 的本机配置：用户自备的 Client ID 与市场代码。
- *
- * <p><b>为什么要用户自己给 Client ID</b>：Spotify 从 2025-05 起只接受机构申请扩展配额，
- * 开发模式一个应用最多 5 个白名单用户 —— 一个面向公众分发的 mod 内置任何 Client ID 都会在
- * 允许个人项目，前提是应用所有者有 Premium），把 Client ID 粘贴进来。于是这份配置是「每个
- * 用户只属于自己」的东西，不进仓库、不随 mod 分发。</p>
- *
- * <p>回调地址固定成本机回环上的一个写死端口：OAuth 的 redirect_uri 必须与开发者后台里登记的
- * 逐字一致，用户只登记一次，所以这里绝不能换成「随机空闲端口」这种对实现友好的形态。
+ * Spotify 登录方式、开发者 Client ID 与市场代码。
+ * 浏览器模式沿用 Folia 的公开桌面客户端身份与回环地址；开发者模式使用用户自建应用。
+ * Client ID 是公开的 OAuth 标识，不是 client secret。
  */
 public final class SpotifyConfigStore {
 
@@ -30,6 +24,9 @@ public final class SpotifyConfigStore {
 
     /** 开发者后台必须登记成一模一样的回调地址；端口见类注释。 */
     public static final String REDIRECT_URI = "http://127.0.0.1:47478/callback";
+    public static final String BROWSER_CLIENT_ID = "65b708073fc0480ea92a077233ca87bd";
+    public static final String BROWSER_REDIRECT_URI = "http://127.0.0.1:5588/login";
+    public enum LoginMode { BROWSER, DEVELOPER }
 
     /**
      * 授权要申请的 scopes。
@@ -57,6 +54,15 @@ public final class SpotifyConfigStore {
 
     public static final String DEFAULT_MARKET = "US";
 
+    /** The desktop client's scope contract used by Folia/librespot. Developer apps keep SCOPES. */
+    private static final String BROWSER_SCOPES = String.join(" ",
+            "app-remote-control", "playlist-modify", "playlist-modify-private", "playlist-modify-public", "playlist-read",
+            "playlist-read-collaborative", "playlist-read-private", "streaming", "ugc-image-upload", "user-follow-modify",
+            "user-follow-read", "user-library-modify", "user-library-read", "user-modify", "user-modify-playback-state",
+            "user-modify-private", "user-personalized", "user-read-birthdate", "user-read-currently-playing", "user-read-email",
+            "user-read-play-history", "user-read-playback-position", "user-read-playback-state", "user-read-private",
+            "user-read-recently-played", "user-top-read");
+
     /** Spotify Client ID 是一串 32 位左右的 base62。长度放宽到 20 以上，只拦手滑截断。 */
     private static final Pattern CLIENT_ID_SHAPE = Pattern.compile("[0-9a-zA-Z]{20,}");
 
@@ -64,6 +70,7 @@ public final class SpotifyConfigStore {
     private static final Object LOCK = new Object();
     private static Data data;
     private static boolean loaded;
+    private static boolean diskless;
 
     private SpotifyConfigStore() {
     }
@@ -71,11 +78,15 @@ public final class SpotifyConfigStore {
     public static final class Config {
         public final String clientId;
         public final String market;
+        public final LoginMode loginMode;
 
         Config(Data source) {
             this.clientId = nonBlank(source.clientId);
             String market = nonBlank(source.market).trim().toUpperCase(Locale.ROOT);
             this.market = market.isEmpty() ? DEFAULT_MARKET : market;
+            // 旧配置没有 mode：已经配过 ID 的用户保留开发者登录，首次使用走浏览器登录。
+            this.loginMode = source.loginMode == null
+                    ? (clientId.isEmpty() ? LoginMode.BROWSER : LoginMode.DEVELOPER) : source.loginMode;
         }
 
         /** Client ID 形状对不对。缺配置与形状不对都算「未配置」，UI 据此给出不同的提示。 */
@@ -84,7 +95,15 @@ public final class SpotifyConfigStore {
         }
 
         public boolean configured() {
-            return clientIdLooksValid();
+            return loginMode == LoginMode.BROWSER || clientIdLooksValid();
+        }
+
+        public String authorizationClientId() {
+            return loginMode == LoginMode.BROWSER ? BROWSER_CLIENT_ID : clientId;
+        }
+
+        public String redirectUri() {
+            return loginMode == LoginMode.BROWSER ? BROWSER_REDIRECT_URI : REDIRECT_URI;
         }
     }
 
@@ -96,12 +115,25 @@ public final class SpotifyConfigStore {
     }
 
     public static String clientId() {
-        return snapshot().clientId;
+        return snapshot().authorizationClientId();
+    }
+
+    public static void saveLoginMode(LoginMode mode) {
+        synchronized (LOCK) {
+            ensureLoaded();
+            data.loginMode = java.util.Objects.requireNonNull(mode);
+            data.updatedAt = System.currentTimeMillis();
+            persistLocked();
+        }
     }
 
     /** 拼好的 scope 串（授权 URL 与 token 交换共用同一份）。 */
     public static String scope() {
         return String.join(" ", SCOPES);
+    }
+
+    public static String scope(LoginMode mode) {
+        return mode == LoginMode.BROWSER ? BROWSER_SCOPES : scope();
     }
 
     /**
@@ -114,6 +146,7 @@ public final class SpotifyConfigStore {
         synchronized (LOCK) {
             ensureLoaded();
             data.clientId = clientId;
+            data.loginMode = LoginMode.DEVELOPER;
             data.updatedAt = System.currentTimeMillis();
             persistLocked();
         }
@@ -139,6 +172,7 @@ public final class SpotifyConfigStore {
             data.clientId = clientId == null ? "" : clientId;
             data.market = market == null ? "" : market;
             loaded = true;
+            diskless = true;
         }
     }
 
@@ -146,6 +180,7 @@ public final class SpotifyConfigStore {
         synchronized (LOCK) {
             data = new Data();
             loaded = true;
+            diskless = true;
         }
     }
 
@@ -169,6 +204,7 @@ public final class SpotifyConfigStore {
     }
 
     private static void persistLocked() {
+        if (diskless) return;
         try {
             java.io.File file = ConfigPaths.SPOTIFY_CONFIG;
             if (!file.getParentFile().isDirectory() && !file.getParentFile().mkdirs()) return;
@@ -185,6 +221,7 @@ public final class SpotifyConfigStore {
     private static final class Data {
         String clientId = "";
         String market = DEFAULT_MARKET;
+        LoginMode loginMode;
         long updatedAt;
     }
 }

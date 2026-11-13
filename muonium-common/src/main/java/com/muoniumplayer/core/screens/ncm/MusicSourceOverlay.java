@@ -19,6 +19,9 @@ import com.muoniumplayer.core.ncm.music.YouTubeSessionStore;
 import com.muoniumplayer.core.ncm.spotify.SpotifyConfigStore;
 import com.muoniumplayer.core.ncm.spotify.SpotifyMusicService;
 import com.muoniumplayer.core.ncm.spotify.SpotifyOAuthFlow;
+import com.muoniumplayer.core.ncm.spotify.SpotifySoloistService;
+import com.muoniumplayer.core.ncm.spotify.SpotifySoloistStore;
+import com.muoniumplayer.core.ncm.spotify.SpotifyConnectMirror;
 import com.muoniumplayer.core.rendering.BrandVectorIcons;
 import com.muoniumplayer.core.rendering.GlassLook;
 import com.muoniumplayer.core.rendering.MusicBrandIcons;
@@ -124,12 +127,17 @@ public final class MusicSourceOverlay extends NcmSheet {
     private static final int PAGE_YOUTUBE_PROXY = 3;
     private static final int PAGE_YOUTUBE_LOGIN = 4;
     private static final int PAGE_SPOTIFY_LOGIN = 5;
+    private static final int PAGE_SPOTIFY_SOLOIST = 6;
 
     /** Cookie 校验要联网（最坏 25 秒），期间把按钮钉成「正在验证…」，不让人连点。 */
     private boolean youtubeLoginBusy;
 
     /** OAuth 有一次浏览器往返（可能几分钟），期间登录态由 SpotifyOAuthFlow 的阶段接管。 */
     private boolean spotifyLoginBusy;
+
+    /** Keep edits through page changes and failed startup; the Key field stays masked. */
+    private String soloistExecutableDraft;
+    private String soloistKeyDraft = "";
 
     /** Apple 的 cookies 校验要联网（一次 /v1/me，最坏 15 秒），期间钉住「正在验证…」。 */
 
@@ -178,7 +186,9 @@ public final class MusicSourceOverlay extends NcmSheet {
             closeLxUrlDialog();
             return;
         }
-        if (page == PAGE_OVERVIEW) {
+        if (page == PAGE_SPOTIFY_SOLOIST) {
+            back(this::showSpotifyLogin).run();
+        } else if (page == PAGE_OVERVIEW) {
             dispose();
         } else {
             back(this::showOverview).run();
@@ -872,12 +882,12 @@ public final class MusicSourceOverlay extends NcmSheet {
         });
     }
 
-    // ── Spotify 登录（自备 Client ID + OAuth PKCE） ───────────────────────────
+    // ── Spotify 登录（浏览器或开发者应用 + OAuth PKCE） ─────────────────────
 
     /**
      * 二级页：Spotify 登录。
      *
-     * <p>与 YouTube 的粘贴 Cookie 同一版式，但两步走：先存 Client ID，再开浏览器授权。
+     * <p>浏览器登录无需额外配置；开发者登录可选用用户自建 Client ID。
      * 状态行是<b>活的</b> —— OAuth 的等待/换token 阶段由 {@link SpotifyOAuthFlow} 的事件推进，
      * 直接读它而不是抄一份快照，回调落地后页面自己翻成「已登录」。</p>
      */
@@ -896,17 +906,22 @@ public final class MusicSourceOverlay extends NcmSheet {
 
         final Panel dialog = sheet(476, () -> 356.0);
         subHeader(dialog, back(this::showOverview), () -> "Spotify · 登录",
-                () -> "自备 Client ID · 播放始终由跨平台换源匹配",
+                () -> "浏览器 / 开发者授权，或 Soloist 本地配对",
                 MusicPlatform.SPOTIFY::getBrandColor);
         tip(dialog, this::spotifyStatusGlyph, this::spotifyLiveStatus, this::spotifyLiveColor, () -> 60.0);
 
         final Panel body = body(dialog, () -> 88.0, () -> 54.0);
         final ScrollPanel feed = feed(body);
-        sectionLabel(strip(feed, 20.0), "Client ID", () -> 4.0,
+        sectionLabel(strip(feed, 20.0), "开发者 Client ID（可选）", () -> 4.0,
                 MusicPlatform.SPOTIFY::getBrandColor);
         final TextFieldWidget input = spotifyClientIdInputRow(strip(feed, 46.0));
         spotifyStepsCard(strip(feed, 96.0));
         spotifyLoginFooter(dialog, input);
+    }
+
+    /** 供账号总览的 Spotify 卡片直达 OAuth 登录页。 */
+    public void openSpotifyLogin() {
+        showSpotifyLogin();
     }
 
     /** Client ID 输入行。预填已保存的值，用户换号时看得见自己粘过什么。 */
@@ -926,8 +941,8 @@ public final class MusicSourceOverlay extends NcmSheet {
         final TextFieldWidget input = new TextFieldWidget(FontManager.pf12);
         row.addChild(input);
         input.setEnabled(true).setFocused(true);
-        input.setPlaceholder("粘贴你的 Spotify Client ID（约 32 位字母数字）");
-        String saved = SpotifyConfigStore.clientId();
+        input.setPlaceholder("仅开发者登录需要：粘贴 Client ID");
+        String saved = SpotifyConfigStore.snapshot().clientId;
         if (!saved.isEmpty()) input.setText(saved);
         input.drawUnderline(false);
         input.setBeforeRenderCallback(() -> {
@@ -954,11 +969,10 @@ public final class MusicSourceOverlay extends NcmSheet {
             surface.setFillAlpha(GlassLook.washAlpha(GlassLook.Surface.PLAYER, 1.0f));
         });
         String[][] steps = {
-                {"①", "developer.spotify.com/dashboard 建应用：勾选 Web API，Redirect URI 填 "
+                {"①", "浏览器登录可直接授权；如需自建应用，Redirect URI 填 "
                         + SpotifyConfigStore.REDIRECT_URI},
-                {"②", "粘贴 Client ID 并保存，再点「打开浏览器授权」（应用所有者需要 Premium）"},
-                {"③", "点播由换源在网易云 / QQ / 酷狗等平台找同名同歌手版本；侧栏「设备控制」"
-                        + "可接管你的 Spotify 播放（Premium 账号）"},
+                {"②", "浏览器授权受限时可选 Soloist：使用你自己的 Premium 账号与 Soloist API Key"},
+                {"③", "歌曲列表与歌词分开加载；Spotify 无歌词时会继续尝试其他歌词源"},
         };
         for (int index = 0; index < steps.length; index++) {
             final LabelWidget label = label(surface, steps[index][1], FontManager.pf12);
@@ -973,27 +987,37 @@ public final class MusicSourceOverlay extends NcmSheet {
     }
 
     private void spotifyLoginFooter(final Panel dialog, final TextFieldWidget input) {
-        final RoundedButtonWidget save = action(dialog, () -> PartyIcons.CHECK,
-                () -> "保存 Client ID", FontManager.pf12bold,
+        final RoundedButtonWidget browserLogin = action(dialog, () -> PartyIcons.LINK,
+                () -> spotifyLoginBusy ? "等待授权…" : "浏览器登录", FontManager.pf12bold,
                 () -> NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT),
-                () -> submitSpotifyClientId(input));
-        save.setBeforeRenderCallback(() -> {
-            save.setBounds(footerTripleWidth(dialog), 30);
-            save.setPosition(PAD + CARD_INSET, dialog.getHeight() - 46);
-            save.setColor(save.isHovering()
+                () -> startSpotifyAuthorize(input, SpotifyConfigStore.LoginMode.BROWSER));
+        browserLogin.setBeforeRenderCallback(() -> {
+            browserLogin.setBounds(spotifyFooterWidth(dialog), 30);
+            browserLogin.setPosition(PAD + CARD_INSET, dialog.getHeight() - 46);
+            browserLogin.setColor(browserLogin.isHovering()
                     ? mix(NCMScreen.getColor(NCMScreen.ColorType.ACCENT), 0xFFFFFF, .16)
                     : NCMScreen.getColor(NCMScreen.ColorType.ACCENT));
         });
 
-        final RoundedButtonWidget authorize = action(dialog, () -> PartyIcons.LINK,
-                () -> spotifyLoginBusy ? "等待授权…" : "打开浏览器授权", FontManager.pf12bold,
-                () -> 0xFFFFFF, () -> startSpotifyAuthorize());
-        authorize.setBeforeRenderCallback(() -> {
-            authorize.setBounds(footerTripleWidth(dialog), 30);
-            authorize.setPosition(PAD + CARD_INSET + footerTripleWidth(dialog) + 8.0, dialog.getHeight() - 46);
-            authorize.setColor(authorize.isHovering()
+        final RoundedButtonWidget developerLogin = action(dialog, () -> PartyIcons.CHECK,
+                () -> "开发者登录", FontManager.pf12bold,
+                () -> 0xFFFFFF, () -> startSpotifyAuthorize(input, SpotifyConfigStore.LoginMode.DEVELOPER));
+        developerLogin.setBeforeRenderCallback(() -> {
+            developerLogin.setBounds(spotifyFooterWidth(dialog), 30);
+            developerLogin.setPosition(PAD + CARD_INSET + spotifyFooterWidth(dialog) + 8.0, dialog.getHeight() - 46);
+            developerLogin.setColor(developerLogin.isHovering()
                     ? mix(NCMScreen.getColor(NCMScreen.ColorType.ACCENT), 0xFFFFFF, .16)
                     : NCMScreen.getColor(NCMScreen.ColorType.ACCENT));
+        });
+
+        final RoundedButtonWidget soloistLogin = action(dialog, () -> PartyIcons.LINK, () -> "Soloist 登录",
+                FontManager.pf12bold, () -> 0xFFFFFF, this::showSpotifySoloist);
+        soloistLogin.setBeforeRenderCallback(() -> {
+            soloistLogin.setBounds(spotifyFooterWidth(dialog), 30);
+            soloistLogin.setPosition(PAD + CARD_INSET + (spotifyFooterWidth(dialog) + 8.0) * 2, dialog.getHeight() - 46);
+            soloistLogin.setColor(soloistLogin.isHovering()
+                    ? NCMScreen.getColor(NCMScreen.ColorType.ELEMENT_HOVER)
+                    : NCMScreen.getColor(NCMScreen.ColorType.ELEMENT_BACKGROUND));
         });
 
         final RoundedButtonWidget signOut = action(dialog, () -> PartyIcons.LOGOUT, () -> "退出登录",
@@ -1011,39 +1035,175 @@ public final class MusicSourceOverlay extends NcmSheet {
                     statusTone = 0;
                 });
         signOut.setBeforeRenderCallback(() -> {
-            signOut.setBounds(footerTripleWidth(dialog), 30);
-            signOut.setPosition(PAD + CARD_INSET + (footerTripleWidth(dialog) + 8.0) * 2, dialog.getHeight() - 46);
+            signOut.setBounds(spotifyFooterWidth(dialog), 30);
+            signOut.setPosition(PAD + CARD_INSET + (spotifyFooterWidth(dialog) + 8.0) * 3, dialog.getHeight() - 46);
             signOut.setColor(signOut.isHovering()
                     ? NCMScreen.getColor(NCMScreen.ColorType.ELEMENT_HOVER)
                     : NCMScreen.getColor(NCMScreen.ColorType.ELEMENT_BACKGROUND));
         });
     }
 
-    /** 保存 Client ID。纯本地校验（形状），不联网 —— 联网的失败留给授权那一步去说。 */
-    private void submitSpotifyClientId(final TextFieldWidget input) {
-        String clientId = input.getText() == null ? "" : input.getText().trim();
-        if (clientId.isEmpty()) {
-            statusText = "请先粘贴 Client ID";
-            statusTone = 2;
-            return;
+    private double spotifyFooterWidth(Panel dialog) {
+        return Math.max(1, (dialog.getWidth() - (PAD + CARD_INSET) * 2 - 24.0) / 4.0);
+    }
+
+    /** Account authorization reads the library; the paired Soloist process plays the selected track. */
+    private void showSpotifySoloist() {
+        page = PAGE_SPOTIFY_SOLOIST;
+        beginPage();
+        SpotifyOAuthFlow.Status flow = SpotifyOAuthFlow.currentStatus();
+        spotifyLoginBusy = flow == SpotifyOAuthFlow.Status.WAITING_BROWSER || flow == SpotifyOAuthFlow.Status.EXCHANGING;
+        statusText = SpotifyMusicService.describeStatus();
+        statusTone = com.muoniumplayer.core.ncm.spotify.SpotifyAuthStore.isLoggedIn() ? 1 : 0;
+        final Panel dialog = sheet(520, () -> 430.0);
+        subHeader(dialog, back(this::showSpotifyLogin), () -> "Spotify · Soloist 登录",
+                () -> "Premium · 通过 Spotify 设备列表配对",
+                MusicPlatform.SPOTIFY::getBrandColor);
+        tip(dialog, () -> SpotifySoloistService.isPaired() ? PartyIcons.CHECK : PartyIcons.LINK,
+                SpotifySoloistService::statusMessage,
+                () -> NCMScreen.getColor(SpotifySoloistService.isPaired()
+                        ? NCMScreen.ColorType.ACCENT : NCMScreen.ColorType.SECONDARY_TEXT), () -> 60.0);
+        final ScrollPanel feed = feed(body(dialog, () -> 88.0, () -> 54.0));
+        sectionLabel(strip(feed, 20), "① Soloist 程序文件或解压目录", () -> 4.0, MusicPlatform.SPOTIFY::getBrandColor);
+        final TextFieldWidget executable = soloistInput(strip(feed, 46), "例如 C:\\Spotify\\soloist.exe 或 C:\\Spotify", false);
+        executable.setText(soloistExecutableDraft == null ? SpotifySoloistStore.executable() : soloistExecutableDraft);
+        executable.setTextChangedCallback(text -> soloistExecutableDraft = text);
+        sectionLabel(strip(feed, 20), "② Soloist API Key（与 Client ID 不同）", () -> 4.0, MusicPlatform.SPOTIFY::getBrandColor);
+        final TextFieldWidget key = soloistInput(strip(feed, 46),
+                SpotifySoloistStore.hasKey() ? "已保存密钥；留空沿用，输入新值替换" : "粘贴你自己的 Soloist API Key", true);
+        key.setText(soloistKeyDraft);
+        key.setTextChangedCallback(text -> soloistKeyDraft = text);
+        final Panel links = strip(feed, 40);
+        final RoundedButtonWidget download = action(links, () -> PartyIcons.LINK, () -> "下载官方 Soloist",
+                FontManager.pf12bold, () -> NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT),
+                () -> com.muoniumplayer.core.utils.other.BrowserUtils.open(SpotifySoloistService.DOWNLOAD_URL));
+        final RoundedButtonWidget dashboard = action(links, () -> PartyIcons.KEY, () -> "申请 Soloist API Key",
+                FontManager.pf12bold, () -> NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT),
+                () -> com.muoniumplayer.core.utils.other.BrowserUtils.open(SpotifySoloistService.KEY_URL));
+        download.setBeforeRenderCallback(() -> {
+            download.setBounds(Math.max(1, (links.getWidth() - (PAD + CARD_INSET) * 2 - 8) / 2), 30);
+            download.setPosition(PAD + CARD_INSET, 4);
+            download.setColor(NCMScreen.getColor(NCMScreen.ColorType.ELEMENT_BACKGROUND));
+        });
+        dashboard.setBeforeRenderCallback(() -> {
+            dashboard.setBounds(download.getWidth(), 30);
+            dashboard.setPosition(PAD + CARD_INSET + download.getWidth() + 8, 4);
+            dashboard.setColor(NCMScreen.getColor(NCMScreen.ColorType.ELEMENT_BACKGROUND));
+        });
+        final Panel account = strip(feed, 40);
+        final RoundedButtonWidget authorize = action(account, () -> PartyIcons.KEY,
+                () -> spotifyLoginBusy ? "等待账号授权…" : "授权账号 / 重新授权",
+                FontManager.pf12bold, () -> NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT),
+                () -> startSpotifyAuthorize(null, SpotifyConfigStore.LoginMode.BROWSER));
+        final RoundedButtonWidget refresh = action(account, () -> PartyIcons.LINK, () -> "刷新我的歌单",
+                FontManager.pf12bold, () -> NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT), () -> {
+                    if (!com.muoniumplayer.core.ncm.spotify.SpotifyAuthStore.isLoggedIn()) {
+                        statusText = "请先点击账号授权，配对状态会继续保留";
+                        statusTone = 2;
+                        return;
+                    }
+                    statusText = "正在读取 Spotify 歌单…";
+                    statusTone = 3;
+                    final Panel requestedPage = dialog;
+                    MultiThreadingUtil.runAsync(() -> {
+                        SpotifyMusicService.refreshUserPlaylists();
+                        String failure = SpotifyMusicService.getUserPlaylistsError();
+                        MultiThreadingUtil.runOnMainThread(() -> {
+                            if (closing || page != PAGE_SPOTIFY_SOLOIST || !getChildren().contains(requestedPage)) return;
+                            statusText = failure.isEmpty()
+                                    ? "已刷新 " + SpotifyMusicService.getUserPlaylistsSnapshot().size() + " 个歌单，可在 Spotify 曲库中打开"
+                                    : failure;
+                            statusTone = failure.isEmpty() ? 1 : 2;
+                            NCMScreen.getInstance().markDirty();
+                        });
+                    });
+                });
+        authorize.setBeforeRenderCallback(() -> {
+            authorize.setBounds(download.getWidth(), 30);
+            authorize.setPosition(PAD + CARD_INSET, 4);
+            authorize.setColor(NCMScreen.getColor(NCMScreen.ColorType.ELEMENT_BACKGROUND));
+        });
+        refresh.setBeforeRenderCallback(() -> {
+            refresh.setBounds(download.getWidth(), 30);
+            refresh.setPosition(PAD + CARD_INSET + download.getWidth() + 8, 4);
+            refresh.setColor(NCMScreen.getColor(NCMScreen.ColorType.ELEMENT_BACKGROUND));
+        });
+        tip(strip(feed, 48), this::spotifyStatusGlyph, this::spotifyLiveStatus, this::spotifyLiveColor, () -> 0.0);
+        for (String line : new String[]{
+                "③ 首次在 Spotify 设备列表选择「MuoniumPlayer Soloist」；以后随游戏自动恢复",
+                "④ 配对后点「同步歌词」；在 Spotify 中选歌，游戏同步歌词与播放控制",
+                "账号授权读取歌单与喜欢的歌曲；Soloist 负责播放，歌单中可直接选歌",
+                "Windows 使用系统加密保存 Key；其他平台仅保留本次会话。程序过期需重新下载"}) {
+            final Panel row = strip(feed, 25);
+            final LabelWidget note = label(row, line, FontManager.pf12);
+            note.setBeforeRenderCallback(() -> {
+                note.setPosition(PAD + CARD_INSET, 4);
+                note.setMaxWidth(Math.max(1, row.getWidth() - (PAD + CARD_INSET) * 2));
+                note.setWidthLimitType(LabelWidget.WidthLimitType.TRIM_TO_WIDTH);
+                note.setColor(NCMScreen.getColor(NCMScreen.ColorType.SECONDARY_TEXT));
+            });
         }
-        if (SpotifyConfigStore.saveClientId(clientId)) {
-            statusText = "已保存 Client ID，现在可以打开浏览器授权";
-            statusTone = 1;
-        } else {
-            statusText = "Client ID 形状不对：应是一串约 32 位的字母数字（在开发者后台的应用页里）";
-            statusTone = 2;
+        final RoundedButtonWidget start = action(dialog, () -> PartyIcons.LINK,
+                () -> SpotifySoloistService.isStarting() ? "正在恢复连接…" : "启动 / 连接",
+                FontManager.pf12bold, () -> 0xFFFFFF, () -> {
+                    if (SpotifySoloistService.isStarting()) return;
+                    if (SpotifyConnectMirror.isSoloist()) SpotifyConnectMirror.stop(null);
+                    SpotifySoloistService.start(executable.getText(), key.getText());
+                });
+        final RoundedButtonWidget follow = action(dialog, () -> PartyIcons.CHECK, () -> "同步歌词",
+                FontManager.pf12bold, () -> 0xFFFFFF, () -> {
+                    SpotifyConnectMirror.startSoloist();
+                    if (SpotifyConnectMirror.isSoloist()) dispose();
+                });
+        final RoundedButtonWidget stop = action(dialog, () -> PartyIcons.LOGOUT, () -> "断开 Soloist",
+                FontManager.pf12bold, () -> NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT), () -> {
+                    if (SpotifyConnectMirror.isSoloist()) SpotifyConnectMirror.stop(null);
+                    SpotifySoloistService.disconnectAndDisableReconnect();
+                });
+        RoundedButtonWidget[] buttons = {start, follow, stop};
+        for (int index = 0; index < buttons.length; index++) {
+            final int slot = index;
+            final RoundedButtonWidget button = buttons[index];
+            button.setBeforeRenderCallback(() -> {
+                button.setBounds(footerTripleWidth(dialog), 30);
+                button.setPosition(PAD + CARD_INSET + (footerTripleWidth(dialog) + 8) * slot, dialog.getHeight() - 46);
+                button.setColor(slot < 2 ? MusicPlatform.SPOTIFY.getBrandColor()
+                        : NCMScreen.getColor(NCMScreen.ColorType.ELEMENT_BACKGROUND));
+            });
         }
+    }
+
+    private TextFieldWidget soloistInput(Panel row, String placeholder, boolean secret) {
+        final TextFieldWidget input = new TextFieldWidget(FontManager.pf12);
+        row.addChild(input);
+        input.setEnabled(true).setPlaceholder(placeholder);
+        input.getTextField().isPassword = secret;
+        input.setBeforeRenderCallback(() -> {
+            input.setBounds(Math.max(1, row.getWidth() - (PAD + CARD_INSET) * 2), 34);
+            input.setPosition(PAD + CARD_INSET, 4);
+            input.setColor(NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT));
+        });
+        return input;
     }
 
     /**
      * 起回调服务并拉起浏览器。全程无网络请求（授权页是 Spotify 的），快到可以直接在点击线程做。
      * 浏览器打不开时把 URL 塞进剪贴板 —— 手动粘贴到浏览器照样能完成授权。
      */
-    private void startSpotifyAuthorize() {
+    private void startSpotifyAuthorize(final TextFieldWidget input,
+                                      final SpotifyConfigStore.LoginMode mode) {
         if (spotifyLoginBusy) return;
+        if (mode == SpotifyConfigStore.LoginMode.BROWSER) {
+            SpotifyConfigStore.saveLoginMode(mode);
+        } else {
+            if (input == null || !SpotifyConfigStore.saveClientId(input.getText())) {
+                statusText = "开发者登录需要有效的 Client ID";
+                statusTone = 2;
+                return;
+            }
+        }
         if (!SpotifyMusicService.isConfigured()) {
-            statusText = "先粘贴并保存 Client ID，再打开授权";
+            statusText = "开发者登录需要先填写有效的 Client ID";
             statusTone = 2;
             return;
         }
@@ -2142,7 +2302,7 @@ public final class MusicSourceOverlay extends NcmSheet {
             // 与 B 站同理：不能把「未登录」写成不可用——搜索本来就不需要登录。
             return SpotifyMusicService.isConfigured()
                     ? "未登录 · 已配置，开浏览器授权后可浏览本人歌单"
-                    : "未登录 · 元数据源，搜索无需登录，登录需自备 Client ID";
+                    : "未登录 · 元数据源，搜索无需登录，可浏览器登录";
         }
         if (platform == MusicPlatform.APPLE) {
             // 与 Spotify 同理：目录搜索公开，登录只是账号能力；gamdl 是完整版的另一条腿，

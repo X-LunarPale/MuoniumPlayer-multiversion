@@ -113,7 +113,7 @@ public final class ConfigPaths {
     public static final File QISHUI_ACCOUNTS = new File(AUTH_ROOT, "qishui_accounts.json");
 
     /**
-     * Spotify 的本机配置：用户自备的 Client ID 与市场代码。
+     * Spotify 的登录方式、可选开发者 Client ID 与市场代码。
      *
      * <p>与凭据分成两个文件：Client ID 不是秘密（它是公开的），改它不必碰 token；
      * 重新授权也不该丢掉用户的配置。Client ID 为什么要用户自备，见
@@ -129,6 +129,11 @@ public final class ConfigPaths {
      * musicid/musickey，Spotify 的 access/refresh token 放进去会在下一次保存时被丢掉。</p>
      */
     public static final File SPOTIFY_AUTH = new File(AUTH_ROOT, "spotify_auth.json");
+
+    /** Soloist uses its own pairing session; no OAuth credentials are written here. */
+    public static final File SPOTIFY_SOLOIST_CONFIG = new File(AUTH_ROOT, "spotify_soloist.json");
+    public static final File SPOTIFY_SOLOIST_DATA = new File(AUTH_ROOT, "spotify_soloist");
+    public static final File SPOTIFY_SOLOIST_CACHE = new File(CACHE_ROOT, "spotify_soloist");
 
     /**
      * Apple Music 的本机配置：media-user-token、storefront 与本音源的偏好开关。

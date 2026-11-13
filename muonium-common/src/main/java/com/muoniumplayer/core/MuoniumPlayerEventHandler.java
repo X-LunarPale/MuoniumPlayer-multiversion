@@ -51,6 +51,7 @@ public class MuoniumPlayerEventHandler implements EventHandler {
             if (System.nanoTime() - startedAt >= MAIN_TASK_BUDGET_NANOS) break;
         }
         Textures.processPendingUploads();
+        com.muoniumplayer.core.ncm.music.CloudMusic.tickMirroredLyrics();
     }
 
     private <V> V runTask(FutureTask<V> task, Logger logger) {

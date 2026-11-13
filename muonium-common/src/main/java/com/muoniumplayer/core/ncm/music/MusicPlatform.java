@@ -27,7 +27,7 @@ public enum MusicPlatform {
      * {@code preview_url} 也从响应里下线了），它的行只提供搜索、本人歌单与账号资料；点播时
      * {@code Music#getPlayUrl()} 返回空，由 {@code CrossSourceSwitcher} 按同名同歌手在其余
      * 平台找替身。也正因如此它<b>绝不能</b>进换源候选表 {@code CANDIDATE_ORDER} ——
-     * 它没有流可以给别人换。凭据是每个用户自建的 Client ID + OAuth PKCE（见
+     * 它没有流可以给别人换。凭据通过浏览器 OAuth PKCE 获取，也支持用户自建 Client ID（见
      * {@code core.ncm.spotify}）。
      *
      * <p>同样<b>追加在末尾</b>，理由同 {@link #SMTC}：稳定键按 {@code name()} 落盘。</p>

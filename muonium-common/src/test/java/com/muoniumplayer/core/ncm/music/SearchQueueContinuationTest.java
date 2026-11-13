@@ -149,8 +149,13 @@ class SearchQueueContinuationTest {
                 "private void sleep(int millis)");
         assertTrue(loop.contains("clearQueuedNext()"), "回到队首就是新一轮歌单");
 
-        // 两处独立起播路径要销账：普通起播与无缝交接（另外一处是这个方法本身）。
-        assertEquals(3, occurrences(cloud, "noteQueuedTrackStarted("),
+        // Soloist 确认起播也要销账；保留内部普通起播与无缝交接的原有两处守卫。
+        String mirror = region(cloud, "public static void adoptExternalMirrorTrack(Music music, boolean keepQueue)",
+                "private static final Object SMOOTH_CLOCK_LOCK");
+        assertEquals(1, occurrences(mirror, "noteQueuedTrackStarted("),
+                "Soloist 必须在确认所选曲目后销账，不能在发命令时提前消费待播身份");
+        assertTrue(mirror.indexOf("noteQueuedTrackStarted(") > mirror.indexOf("if (keepQueue"));
+        assertEquals(3, occurrences(cloud, "noteQueuedTrackStarted(") - occurrences(mirror, "noteQueuedTrackStarted("),
                 "少一处，播过的歌就会一直挂在账上");
         assertFalse(region(cloud, "private boolean adoptCrossSourceReplacement",
                         "CoverThemePalette.set(replacement.music.getCoverPalette())")

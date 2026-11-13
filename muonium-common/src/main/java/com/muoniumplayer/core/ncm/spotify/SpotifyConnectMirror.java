@@ -12,7 +12,7 @@ import com.muoniumplayer.core.utils.other.multithreading.MultiThreadingUtil;
  * 全部跟着 Spotify 走——模组自己的音频引擎全程不出声。
  *
  * <p>协议与 {@link ExternalPlayback}（SMTC 系统播放器镜像）同源，只换供态源：SMTC 读
- * Windows 的媒体会话进程，这里轮询 {@code GET /me/player}（3 秒一拍 + 墙钟外推，见
+ * Windows 的媒体会话进程，这里读取 Soloist 事件或轮询 {@code GET /me/player}（后者 3 秒一拍 + 墙钟外推，见
  * {@link SpotifyConnectService.PlaybackState#positionMsNow()}）。两条铁律照抄：</p>
  * <ul>
  *   <li><b>一个系统里只有一个「正在播放」是真的</b>——接管时停掉内部播放并拒绝再起播
@@ -24,7 +24,7 @@ import com.muoniumplayer.core.utils.other.multithreading.MultiThreadingUtil;
  * <p><b>会话级</b>：接管状态不落盘，重开游戏后在设备面板重新接管。Spotify Connect 本来
  * 就是「此刻哪台设备在放」的实时状态，隔夜恢复没有意义。</p>
  *
- * <p><b>线程模型</b>：唯一的常驻线程是轮询（daemon，仅接管期间活着）；所有对 CloudMusic
+ * <p><b>线程模型</b>：轮询 daemon 仅接管期间活着，控制命令经单独的串行 daemon 发出；所有对 CloudMusic
  * 全局字段的写入经 {@link MultiThreadingUtil#runOnMainThread} 排到主线程，与播放线程
  * 同一套身份协议（先递增 generation 作废旧会话）。读侧（{@code positionMs()} 等）只碰
  * volatile 快照，渲染线程每帧调用零开销。</p>
@@ -42,12 +42,30 @@ public final class SpotifyConnectMirror {
 
     private static volatile boolean mirroring;
     private static volatile boolean running;
+    private static volatile boolean soloist;
+    private static volatile long mirrorGeneration;
     /** 用户点「接管」时选的设备；空 = 跟随当前活动设备。轮询首拍据此转移一次。 */
     private static volatile String desiredDeviceId = "";
 
     private static volatile String appliedTrackKey = "";
     private static volatile String lastAnnouncedTrackKey = "";
     private static volatile long lastNoticeAtMillis;
+    private static volatile java.util.function.Consumer<Runnable> mainThread = MultiThreadingUtil::runOnMainThread;
+
+    static void setMainThreadForTest(java.util.function.Consumer<Runnable> scheduler) {
+        mainThread = scheduler == null ? MultiThreadingUtil::runOnMainThread : scheduler;
+    }
+    private static final java.util.concurrent.ExecutorService COMMANDS =
+            java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
+                Thread thread = new Thread(task, "Spotify Controls");
+                thread.setDaemon(true);
+                return thread;
+            });
+    private static volatile SpotifySoloistTrackWatch managedTrack;
+    private static volatile SpotifySoloistTrackWatch appliedSelection;
+    private static volatile SpotifySoloistTrackWatch handledEnd;
+
+    public static boolean managesSoloistQueue() { return isSoloist() && managedTrack != null; }
 
     // 音量三值，与 SMTC 同构：wanted=拖动中的档位（必须立刻显示），sent=已发出的档位
     // （合并拖动，一帧一条命令会把设备刷爆），echo=设备报回来的真值。
@@ -70,22 +88,35 @@ public final class SpotifyConnectMirror {
 
     /** 此刻有没有一台 Spotify 设备在供态：接管开着，且最近一拍真的读到了状态。 */
     public static boolean hasSession() {
-        return mirroring && SpotifyConnectService.lastKnownPlayback() != null;
+        SpotifyConnectService.PlaybackState state = currentPlayback();
+        return mirroring && state != null && (!soloist || state.track != null || managedTrack != null);
+    }
+
+    public static boolean isSoloist() { return mirroring && soloist; }
+
+    private static SpotifyConnectService.PlaybackState currentPlayback() {
+        return soloist ? SpotifySoloistService.playback() : SpotifyConnectService.lastKnownPlayback();
     }
 
     public static boolean isPlaying() {
-        SpotifyConnectService.PlaybackState state = SpotifyConnectService.lastKnownPlayback();
+        SpotifySoloistTrackWatch requested = managedTrack;
+        if (requested != null && requested.outcome(System.currentTimeMillis()) == SpotifySoloistTrackWatch.Outcome.ENDED) return false;
+        SpotifyConnectService.PlaybackState state = currentPlayback();
         return state != null && state.playing;
     }
 
     /** 逐帧连续的播放位置（快照位置 + 正在播期间的墙钟外推）。 */
     public static long positionMs() {
-        SpotifyConnectService.PlaybackState state = SpotifyConnectService.lastKnownPlayback();
+        SpotifySoloistTrackWatch requested = managedTrack;
+        if (requested != null && requested.outcome(System.currentTimeMillis()) == SpotifySoloistTrackWatch.Outcome.ENDED) return requested.duration();
+        SpotifyConnectService.PlaybackState state = currentPlayback();
         return state == null ? 0L : state.positionMsNow();
     }
 
     public static long durationMs() {
-        SpotifyConnectService.PlaybackState state = SpotifyConnectService.lastKnownPlayback();
+        SpotifySoloistTrackWatch requested = managedTrack;
+        if (requested != null && requested.duration() > 0) return requested.duration();
+        SpotifyConnectService.PlaybackState state = currentPlayback();
         if (state != null && state.durationMs > 0L) return state.durationMs;
         Music applied = CloudMusic.currentlyPlaying;
         return applied == null ? 0L : applied.getDuration();
@@ -93,7 +124,7 @@ public final class SpotifyConnectMirror {
 
     /** 当前正在供态的设备（命令的对象）；没有快照时交空串，让 Spotify 自己选活动设备。 */
     public static String currentDeviceId() {
-        SpotifyConnectService.PlaybackState state = SpotifyConnectService.lastKnownPlayback();
+        SpotifyConnectService.PlaybackState state = currentPlayback();
         return state == null ? "" : state.deviceId;
     }
 
@@ -123,6 +154,61 @@ public final class SpotifyConnectMirror {
             notify("Spotify 授权缺少播放控制权限，请在登录页重新授权");
             return;
         }
+        startMirror(deviceId, false);
+    }
+
+    /** Soloist authenticates by Connect pairing, independently of the Web API OAuth session. */
+    public static void startSoloist() {
+        if (!SpotifySoloistService.isPaired()) {
+            notify("请先在 Spotify 设备列表中选择 MuoniumPlayer Soloist 完成配对");
+            return;
+        }
+        startMirror("soloist", true);
+    }
+
+    /** A library/search selection is played by the paired local Spotify device. */
+    public static synchronized void playSoloistTrack(Music song) {
+        if (song == null || !song.isSpotify() || !SpotifySoloistService.isPaired()) return;
+        final String id = song.getSourceId();
+        final SpotifySoloistTrackWatch requested = new SpotifySoloistTrackWatch(id, song.getDuration());
+        requested.dispatched(System.currentTimeMillis());
+        if (!isSoloist()) startMirror("soloist", true, requested);
+        else managedTrack = requested;
+        runAsync(() -> {
+            if (managedTrack != requested) return;
+            SpotifySoloistService.repeatOff();
+            if (managedTrack != requested) return;
+            SpotifySoloistService.playTrack(id, requested);
+            // A dispatched command is not an acknowledgement of playback. Later seek/pause commands
+            // wait here, while a newer selection cancels this wait without blocking the UI.
+            while (mirroring && managedTrack == requested && SpotifySoloistService.isPaired()
+                    && requested.outcome(System.currentTimeMillis()) == SpotifySoloistTrackWatch.Outcome.WAITING) {
+                Thread.sleep(25);
+            }
+        });
+    }
+
+    /** A user queued a song while following an already playing local device. */
+    public static synchronized void manageCurrentSoloistTrack(Music song) {
+        if (!isSoloist() || song == null || !song.isSpotify()) return;
+        SpotifySoloistTrackWatch requested = new SpotifySoloistTrackWatch(song.getSourceId(), song.getDuration());
+        managedTrack = requested;
+        appliedSelection = requested;
+        SpotifySoloistService.watchCurrent(requested);
+        runAsync(() -> { if (managedTrack == requested) SpotifySoloistService.repeatOff(); });
+    }
+
+    private static synchronized void startMirror(String deviceId, boolean useSoloist) {
+        startMirror(deviceId, useSoloist, null);
+    }
+
+    private static synchronized void startMirror(String deviceId, boolean useSoloist,
+                                                   SpotifySoloistTrackWatch requested) {
+        final long attempt = ++mirrorGeneration;
+        soloist = useSoloist;
+        managedTrack = requested;
+        appliedSelection = null;
+        handledEnd = null;
         ExternalPlayback.forceDetachIfMirroring();
         desiredDeviceId = deviceId == null ? "" : deviceId.trim();
         appliedTrackKey = "";
@@ -131,23 +217,33 @@ public final class SpotifyConnectMirror {
         sentVolume = Float.NaN;
         echoVolume = Float.NaN;
         mirroring = true;
-        if (!running) {
-            Thread thread = new Thread(SpotifyConnectMirror::pollLoop, "Spotify Connect Mirror");
-            thread.setDaemon(true);
-            running = true;
-            thread.start();
-        }
+        mainThread.accept(() -> {
+            if (mirrorGeneration == attempt && mirroring && managedTrack == null
+                    && appliedTrackKey.isEmpty() && CloudMusic.player == null) {
+                CloudMusic.clearExternalMirrorState();
+            }
+        });
+        Thread thread = new Thread(() -> pollLoop(attempt), "Spotify Connect Mirror");
+        thread.setDaemon(true);
+        running = true;
+        thread.start();
         notify("正在接管 Spotify 播放…");
     }
 
     /** 结束接管并清掉写进 CloudMusic 的播放态。{@code reasonForUser} 可为空。 */
-    public static void stop(String reasonForUser) {
+    public static synchronized void stop(String reasonForUser) {
         boolean was = mirroring;
         mirroring = false;
+        ++mirrorGeneration;
+        running = false;
+        managedTrack = null;
+        appliedSelection = null;
+        handledEnd = null;
+        SpotifySoloistService.watchCurrent(null);
         desiredDeviceId = "";
         appliedTrackKey = "";
         if (was) {
-            MultiThreadingUtil.runOnMainThread(() -> {
+            mainThread.accept(() -> {
                 // 清场前再看一眼：如果接管结束的间隙里内部播放已经起来了，别把它误杀。
                 if (!mirroring && CloudMusic.player == null) {
                     try {
@@ -160,10 +256,29 @@ public final class SpotifyConnectMirror {
         if (reasonForUser != null && !reasonForUser.isEmpty()) notify(reasonForUser);
     }
 
+    private static synchronized void stopAttempt(long attempt, String reason) {
+        if (mirrorGeneration == attempt) stop(reason);
+    }
+
+    /** Compare and retire under the same monitor used to install a selection. */
+    private static synchronized boolean retireManagedSelection(SpotifySoloistTrackWatch requested,
+            long attempt, SpotifySoloistTrackWatch.Outcome outcome) {
+        if (!mirroring || mirrorGeneration != attempt || managedTrack != requested) return false;
+        if (outcome == SpotifySoloistTrackWatch.Outcome.FAILED) {
+            stop("Soloist 未确认所选歌曲起播，请重新选择歌曲或检查设备");
+        } else if (outcome == SpotifySoloistTrackWatch.Outcome.REPLACED) {
+            managedTrack = null;
+            appliedSelection = null;
+            appliedTrackKey = "";
+            SpotifySoloistService.watchCurrent(null);
+        } else return false;
+        return true;
+    }
+
     /** 面板状态行用的一句话。 */
     public static String statusLabel() {
         if (!mirroring) return "";
-        SpotifyConnectService.PlaybackState state = SpotifyConnectService.lastKnownPlayback();
+        SpotifyConnectService.PlaybackState state = currentPlayback();
         if (state == null) return "等待 Spotify 设备响应…";
         String device = state.deviceName.isEmpty() ? "Spotify 设备" : state.deviceName;
         return device + (state.playing ? " · 播放中" : " · 已暂停");
@@ -173,25 +288,43 @@ public final class SpotifyConnectMirror {
 
     public static void toggle() {
         final boolean wasPlaying = isPlaying();
+        final SpotifySoloistTrackWatch requested = managedTrack;
+        if (requested != null) requested.pause(wasPlaying);
+        if (!wasPlaying && requested != null
+                && requested.outcome(System.currentTimeMillis()) == SpotifySoloistTrackWatch.Outcome.ENDED) {
+            CloudMusic.replaySoloistQueueTrack();
+            return;
+        }
         runAsync(() -> {
+            if (requested != null && managedTrack != requested) return;
             if (wasPlaying) {
-                SpotifyConnectService.pause(currentDeviceId());
+                if (soloist) SpotifySoloistService.send("pause");
+                else SpotifyConnectService.pause(currentDeviceId());
             } else {
-                SpotifyConnectService.resume(currentDeviceId());
+                if (soloist) SpotifySoloistService.send("play");
+                else SpotifyConnectService.resume(currentDeviceId());
             }
         });
     }
 
     public static void next() {
-        runAsync(() -> SpotifyConnectService.next(currentDeviceId()));
+        if (managesSoloistQueue()) { CloudMusic.stepSoloistQueue(1, false); return; }
+        runAsync(() -> {
+            if (soloist) SpotifySoloistService.send("skip_next");
+            else SpotifyConnectService.next(currentDeviceId());
+        });
     }
 
     public static void previous() {
-        runAsync(() -> SpotifyConnectService.previous(currentDeviceId()));
+        if (managesSoloistQueue()) { CloudMusic.stepSoloistQueue(-1, false); return; }
+        runAsync(() -> {
+            if (soloist) SpotifySoloistService.send("skip_prev");
+            else SpotifyConnectService.previous(currentDeviceId());
+        });
     }
 
     public static boolean canSeek() {
-        return mirroring && SpotifyConnectService.lastKnownPlayback() != null;
+        return mirroring && currentPlayback() != null;
     }
 
     /**
@@ -203,7 +336,17 @@ public final class SpotifyConnectMirror {
             noticeThrottled("Spotify 设备没就绪，暂时不能拖动进度");
             return;
         }
-        runAsync(() -> SpotifyConnectService.seek(positionMs, currentDeviceId()));
+        SpotifySoloistTrackWatch previous = managedTrack;
+        if (previous != null && previous.outcome(System.currentTimeMillis()) == SpotifySoloistTrackWatch.Outcome.ENDED) {
+            CloudMusic.replaySoloistQueueTrack();
+        }
+        final SpotifySoloistTrackWatch requested = managedTrack;
+        if (requested != null) requested.seek(positionMs, System.currentTimeMillis());
+        runAsync(() -> {
+            if (requested != null && managedTrack != requested) return;
+            if (soloist) SpotifySoloistService.seek(positionMs);
+            else SpotifyConnectService.seek(positionMs, currentDeviceId());
+        });
     }
 
     /** 相对跳转：目标按当前外推位置夹进 [0, 时长]，交给 {@link #seekTo}。 */
@@ -218,7 +361,7 @@ public final class SpotifyConnectMirror {
      */
     public static boolean writeVolume(float level) {
         if (!mirroring) return false;
-        SpotifyConnectService.PlaybackState state = SpotifyConnectService.lastKnownPlayback();
+        SpotifyConnectService.PlaybackState state = currentPlayback();
         if (state == null || !state.supportsVolume || state.volumePercent < 0) {
             noticeThrottled("这台 Spotify 设备不可调音量");
             return true;
@@ -237,34 +380,36 @@ public final class SpotifyConnectMirror {
 
     // ── 轮询 ────────────────────────────────────────────────────────────────
 
-    private static void pollLoop() {
-        long interval = POLL_INTERVAL_MS;
+    private static void pollLoop(long attempt) {
+        long interval = soloist ? 250L : POLL_INTERVAL_MS;
         int emptyStreak = 0;
         int failureStreak = 0;
-        boolean transferPending = !desiredDeviceId.isEmpty();
-        while (running) {
+        boolean transferPending = !soloist && !desiredDeviceId.isEmpty();
+        while (running && mirrorGeneration == attempt) {
             sleepSlice(interval);
-            if (!mirroring || !running) break;
-            if (!SpotifyMusicService.isLoggedIn()) {
-                stop("Spotify 登录已失效，接管结束");
+            if (!mirroring || !running || mirrorGeneration != attempt) break;
+            if (soloist ? !SpotifySoloistService.isPaired() : !SpotifyMusicService.isLoggedIn()) {
+                stopAttempt(attempt, "Spotify 登录已失效，接管结束");
                 break;
             }
             try {
-                SpotifyConnectService.PlaybackState state = SpotifyConnectService.fetchPlayback();
+                SpotifyConnectService.PlaybackState state = soloist
+                        ? SpotifySoloistService.playback() : SpotifyConnectService.fetchPlayback();
+                if (mirrorGeneration != attempt) break;
                 if (state == null) {
                     // 204：没有任何设备在播。偶尔一拍可能只是切歌间隙，连着两拍才放手。
                     emptyStreak++;
                     failureStreak = 0;
                     if (emptyStreak >= EMPTY_STREAK_LIMIT) {
-                        stop("Spotify 已停止播放，接管结束");
+                        stopAttempt(attempt, "Spotify 已停止播放，接管结束");
                         break;
                     }
                     continue;
                 }
                 emptyStreak = 0;
                 failureStreak = 0;
-                interval = POLL_INTERVAL_MS;
-                SpotifyConnectService.recordPlayback(state);
+                interval = soloist ? 250L : POLL_INTERVAL_MS;
+                if (!soloist) SpotifyConnectService.recordPlayback(state);
                 if (transferPending) {
                     transferPending = false;
                     String wanted = desiredDeviceId;
@@ -276,25 +421,67 @@ public final class SpotifyConnectMirror {
                 }
                 adoptEchoVolume(state);
                 tickVolumeSend();
+                SpotifySoloistTrackWatch requested = managedTrack;
+                if (soloist && requested != null) {
+                    SpotifySoloistTrackWatch.Outcome outcome = requested.outcome(System.currentTimeMillis());
+                    if (outcome == SpotifySoloistTrackWatch.Outcome.ENDED) {
+                        finishManagedTrack(requested, attempt);
+                        continue;
+                    }
+                    if (outcome == SpotifySoloistTrackWatch.Outcome.FAILED) {
+                        retireManagedSelection(requested, attempt, outcome);
+                        continue;
+                    }
+                    if (outcome == SpotifySoloistTrackWatch.Outcome.REPLACED) {
+                        // A selection in another Spotify app before this song's end takes back control.
+                        if (!retireManagedSelection(requested, attempt, outcome)) continue;
+                    } else if (outcome == SpotifySoloistTrackWatch.Outcome.WAITING
+                            || state.track == null || !requested.trackId.equals(state.track.id)) {
+                        continue;
+                    }
+                }
                 String trackKey = state.trackKey();
-                if (!trackKey.isEmpty() && !trackKey.equals(appliedTrackKey)) {
-                    applyTrack(trackKey, state.track);
+                SpotifySoloistTrackWatch selection = managedTrack;
+                if (!trackKey.isEmpty() && (!trackKey.equals(appliedTrackKey)
+                        || selection != null && selection != appliedSelection)) {
+                    applyTrack(trackKey, state.track, attempt, selection);
+                } else if (soloist && trackKey.isEmpty() && !appliedTrackKey.isEmpty()) {
+                    appliedTrackKey = "";
+                    mainThread.accept(() -> {
+                        if (mirroring && mirrorGeneration == attempt && managedTrack == null
+                                && appliedTrackKey.isEmpty()) CloudMusic.clearExternalMirrorState();
+                    });
                 }
             } catch (Throwable failure) {
+                if (mirrorGeneration != attempt) break;
                 String message = SpotifyConnectService.userMessage(failure);
                 if (isFatal(failure)) {
-                    stop(message.isEmpty() ? "Spotify 接管已结束" : message);
+                    stopAttempt(attempt, message.isEmpty() ? "Spotify 接管已结束" : message);
                     break;
                 }
                 failureStreak++;
                 interval = nextInterval(interval);
                 if (failureStreak >= FAILURE_STREAK_LIMIT) {
-                    stop("Spotify 连接持续失败，接管结束");
+                    stopAttempt(attempt, "Spotify 连接持续失败，接管结束");
                     break;
                 }
             }
         }
-        running = false;
+        if (mirrorGeneration == attempt) running = false;
+    }
+
+    private static void finishManagedTrack(SpotifySoloistTrackWatch requested, long attempt) {
+        if (handledEnd == requested) return;
+        handledEnd = requested;
+        runAsync(() -> {
+            if (managedTrack != requested) return;
+            SpotifySoloistService.send("pause");
+            mainThread.accept(() -> {
+                if (mirroring && mirrorGeneration == attempt && managedTrack == requested) {
+                    CloudMusic.stepSoloistQueue(1, true);
+                }
+            });
+        });
     }
 
     private static boolean isFatal(Throwable failure) {
@@ -313,14 +500,18 @@ public final class SpotifyConnectMirror {
     // ── 落地 ────────────────────────────────────────────────────────────────
 
     /** 换歌：解析出的曲目交给主线程按镜像协议落地。无论落地成败先记账，同一首不重复解析。 */
-    private static void applyTrack(String trackKey, SpotifyMusicService.Track track) {
+    private static void applyTrack(String trackKey, SpotifyMusicService.Track track, long attempt,
+                                   SpotifySoloistTrackWatch selection) {
+        if (selection != null && (selection != managedTrack || !selection.trackId.equals(track.id))) return;
         appliedTrackKey = trackKey;
+        appliedSelection = selection;
         final Music music = Music.fromSpotifyTrack(track);
         if (music == null) return;
-        MultiThreadingUtil.runOnMainThread(() -> {
-            if (!mirroring) return;
+        mainThread.accept(() -> {
+            if (!mirroring || mirrorGeneration != attempt || !trackKey.equals(appliedTrackKey)
+                    || managedTrack != selection) return;
             try {
-                CloudMusic.adoptExternalMirrorTrack(music);
+                CloudMusic.adoptExternalMirrorTrack(music, selection != null);
                 if (!trackKey.equals(lastAnnouncedTrackKey)) {
                     lastAnnouncedTrackKey = trackKey;
                     String artist = music.getArtists() == null || music.getArtists().isEmpty()
@@ -361,7 +552,8 @@ public final class SpotifyConnectMirror {
         final int percent = Math.round(wanted * 100f);
         runAsync(() -> {
             try {
-                SpotifyConnectService.setVolume(percent, device);
+                if (soloist) SpotifySoloistService.volume(percent);
+                else SpotifyConnectService.setVolume(percent, device);
             } catch (Throwable failure) {
                 noticeThrottled(SpotifyConnectService.userMessage(failure));
             }
@@ -371,14 +563,16 @@ public final class SpotifyConnectMirror {
     // ── 小工具 ──────────────────────────────────────────────────────────────
 
     private static void runAsync(ThrowingRunnable command) {
-        MultiThreadingUtil.runAsync(() -> {
-            if (!mirroring) return;
+        final long attempt = mirrorGeneration;
+        COMMANDS.execute(() -> {
+            if (!mirroring || mirrorGeneration != attempt) return;
             try {
                 command.run();
             } catch (Throwable failure) {
+                if (mirrorGeneration != attempt) return;
                 String message = SpotifyConnectService.userMessage(failure);
                 if (isFatal(failure)) {
-                    stop(message.isEmpty() ? "Spotify 接管已结束" : message);
+                    stopAttempt(attempt, message.isEmpty() ? "Spotify 接管已结束" : message);
                 } else {
                     System.err.println("[Music/Spotify] 控制命令失败: " + failure.getMessage());
                 }
