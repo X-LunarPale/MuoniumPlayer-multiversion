@@ -8,7 +8,7 @@
 - Apple Music 支持导入本人 Cookie 登录播放，优先使用官方逐词时间轴，并修复资料库和歌单只加载前 100 首的问题。歌曲本身没有逐词时间轴时，按实际可用歌词降级显示。
 - **Spotify 的 Soloist 登录本质上使用外部播放器，音频不经过模组自身的处理链路，因此无法实现场景声学。** 歌词和游戏内播放控制可以正常同步。
 
-**本项目纯粹因为自己需要才做兼容，以后可能不会更新，不保证持续维护。** 当前游戏内实测范围是 **Minecraft 1.21.1 / NeoForge 21.1.266 / Windows**；**Minecraft 26.3 Fabric 已完成本地和 Actions 构建、相关回归测试，并确认客户端加载及 Skija 初始化正常，播放与歌词实测结果待确认**。其他版本和加载器的兼容性没有完成同等实测。
+**本项目纯粹因为自己需要才做兼容，以后可能不会更新，不保证持续维护。** 当前游戏内实测范围是 **Minecraft 1.21.1 / NeoForge 21.1.266 / Windows** 和 **Minecraft 26.3 / Fabric Loader 0.20.1 / Fabric API 0.166.2+26.3 / Windows**。26.3 已完成本地和 Actions 构建、相关回归测试，用户已确认 Spotify 直接恢复播放、歌单切歌、HUD/3D 逐字歌词和 Apple Music 播放均正常。其他版本和加载器的兼容性没有完成同等实测。
 
 下载本 fork 的构建包请使用 [本仓库 Releases](https://github.com/crx97220130101-dotcom/MuoniumPlayer-multiversion/releases)。Actions 分别提供 [NeoForge 1.21.1 构建](https://github.com/crx97220130101-dotcom/MuoniumPlayer-multiversion/actions/workflows/fork-neoforge-1.21.1.yml) 和 [Fabric 26.3 构建](https://github.com/crx97220130101-dotcom/MuoniumPlayer-multiversion/actions/workflows/fork-fabric-26.3.yml)，均包含 Spotify / Apple Music 相关回归测试、可安装的 jar 和 SHA-256 校验文件。
 
