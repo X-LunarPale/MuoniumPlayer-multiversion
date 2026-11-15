@@ -34,6 +34,7 @@ public class AudioSample extends SoundObject {
 	// 使isPlaying()返回true的辅助变量
 	// 调用play()之后的第二个，但音频数据尚未排队
 	private long isPlayingAtLeastUntil = 0;
+	private long playbackGeneration;
 
 	public AudioSample(int frames) {
 		this(frames, false);
@@ -191,7 +192,7 @@ public class AudioSample extends SoundObject {
 	 * @ webref采样： AudioSample
 	 * @ webBrief将播放指针提示到音频采样中的固定位置。
 	 **/
-	public void cue(float time) {
+	public synchronized void cue(float time) {
 		if (this.setStartTime(time)) {
 			this.stop();
 			this.setStartFrameCountOffset();
@@ -206,7 +207,7 @@ public class AudioSample extends SoundObject {
 	 * 将播放头提示到 audiosample 中的固定位置。
 	 *            开始播放的帧编号。
 	 **/
-	public void cueFrame(int frameNumber) {
+	public synchronized void cueFrame(int frameNumber) {
 		if (this.setStartFrame(frameNumber)) {
 			this.stop();
 			this.setStartFrameCountOffset();
@@ -274,7 +275,7 @@ public class AudioSample extends SoundObject {
 	 * @ webref采样： AudioSample
 	 * @ webBrief跳转到音频示例中的特定位置。
 	 **/
-	public void jump(float time) {
+	public synchronized void jump(float time) {
 		// FIXME 这目前仅适用于*播放*文件，如果
 		// @param time 要跳到的位置，单位秒
 		if (this.setStartTime(time)) {
@@ -294,7 +295,7 @@ public class AudioSample extends SoundObject {
 	 * @ webref采样： AudioSample
 	 * @ webBrief在不中断播放的情况下跳转到音频采样中的特定位置。
 	 **/
-	public void jumpFrame(int frameNumber) {
+	public synchronized void jumpFrame(int frameNumber) {
 		if (this.setStartFrame(frameNumber)) {
 			this.stop();
 			// 如果调用jumpFrame()时文件尚未播放，只需开始播放即可
@@ -326,7 +327,7 @@ public class AudioSample extends SoundObject {
 	// 不支持FIXME 提示文件的子节进行循环
 	// 时刻，因为循环信息需要正确存储到
 	// 计算当前位置
-	private void loopInternal(int startFrame, int numFrames, int numLoops) {
+	private synchronized void loopInternal(int startFrame, int numFrames, int numLoops) {
 		// 使用私有构造函数，它会复制采样以及所有播放
 		this.stop();
 		super.play(); // 添加玩家
@@ -335,7 +336,7 @@ public class AudioSample extends SoundObject {
 		QueueDataCommand cmd = this.player.dataQueue.createQueueDataCommand(this.sample, startFrame, numFrames);
 		// TODO setAutoStop(true) ?
 		// 始终使用当前采样播放器
-		cmd.setCallback(new PlaybackFinishedCallback());
+		cmd.setCallback(new PlaybackFinishedCallback(++playbackGeneration));
 		// TODO how to loop indefinitely??
 		// TODO 如何无限循环？？
 		// 首次播放之后*重复*的次数
@@ -423,7 +424,7 @@ public class AudioSample extends SoundObject {
 //	public void loopSection(float start, float duration, int循环) {
 //	}
 
-	Runnable onFinish = null;
+	volatile Runnable onFinish = null;
 
 	public void setOnFinished(Runnable onFinish) {
 		this.onFinish = onFinish;
@@ -441,11 +442,20 @@ public class AudioSample extends SoundObject {
 	 */
 
 	private class PlaybackFinishedCallback implements UnitDataQueueCallback {
-		public void finished(QueueDataEvent event) {
-			stop();
+		private final long generation;
 
-			if (onFinish != null) {
-				onFinish.run();
+		private PlaybackFinishedCallback(long generation) {
+			this.generation = generation;
+		}
+
+		public void finished(QueueDataEvent event) {
+			synchronized (AudioSample.this) {
+				// A completed buffer can arrive after pause/seek queued a new segment.
+				if (generation != playbackGeneration) return;
+				stop();
+				if (onFinish != null) {
+					onFinish.run();
+				}
 			}
 		}
 		public void looped(QueueDataEvent event) {
@@ -458,18 +468,19 @@ public class AudioSample extends SoundObject {
 		this.playInternal(this.startFrame, this.frames() - this.startFrame);
 	}
 
-	private void playInternal(int startFrame, int numFrames) {
+	private synchronized void playInternal(int startFrame, int numFrames) {
+		long generation = ++playbackGeneration;
 		super.play(); // 添加玩家
 		this.setStartFrameCountOffset();
 		// 只有queueImmediate()保证对.hasMore()的直接后续调用返回true
 		QueueDataCommand cmd = this.player.dataQueue.createQueueDataCommand(this.sample, startFrame, numFrames);
-		cmd.setCallback(new PlaybackFinishedCallback());
+		cmd.setCallback(new PlaybackFinishedCallback(generation));
 		this.player.getSynthesizer().queueCommand(cmd);
 		this.isPlayingAtLeastUntil = System.currentTimeMillis() + 50;
 		this.isPlaying = true;
 	}
 
-	public void play() {
+	public synchronized void play() {
 		// play()与jump()的不同之处在于，如果当前样本是
 		// 已经播放，它创建了一个新的播放器对象来播放
 		// 到达末尾后跳回采样的最开头
@@ -539,7 +550,7 @@ public class AudioSample extends SoundObject {
 		this.play(rate, pos, amp, add);
 	}
 
-	public void playFor(float duration) {
+	public synchronized void playFor(float duration) {
 		AudioSample source = this.getUnusedPlayer();
 		source.playInternal(this.startFrame, Math.min(Math.round(duration * this.sampleRate()), this.frames() - this.startFrame));
 		// FIXME 在播放结束时， startFrame仍然是最初提示的，
@@ -670,7 +681,8 @@ public class AudioSample extends SoundObject {
 	 * @ webref采样： AudioSample
 	 * 一次性设置多个参数。
 	 **/
-	public void stop() {
+	public synchronized void stop() {
+		playbackGeneration++;
 		super.stop();
 		this.player.dataQueue.clear();
 		this.isPlaying = false;
@@ -739,7 +751,7 @@ public class AudioSample extends SoundObject {
 	 * @ webref采样： AudioSample
 	 * 下次调用 <b>play()</b> 将从暂停处继续播放。
 	 */
-	public void pause() {
+	public synchronized void pause() {
 		if (this.isPlaying()) {
 			this.stop();
 			this.startFrame = this.positionFrame();

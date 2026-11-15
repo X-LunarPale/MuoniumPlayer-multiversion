@@ -453,11 +453,7 @@ public final class IslandSearchOverlay extends ExtensionScreen implements Shared
         // 回车：有高亮联想词就用它，否则直接搜输入框原文（绕过防抖）。
         if ((keyCode == Keyboard.KEY_RETURN || keyCode == Keyboard.KEY_NUMPADENTER)
                 && this.searchField.isFocused()) {
-            String keyword = highlightedSuggestionOrText();
-            String due = IslandSearchModel.consumeImmediateSearch(keyword);
-            if (due != null) {
-                submitSearch(due);
-            }
+            acceptSearchText(highlightedSuggestionOrText());
             return;
         }
 
@@ -482,6 +478,16 @@ public final class IslandSearchOverlay extends ExtensionScreen implements Shared
             return this.suggestions.get(this.suggestHighlight).text;
         }
         return this.searchField.getText() == null ? "" : this.searchField.getText();
+    }
+
+    private void acceptSearchText(String text) {
+        String completion = text == null ? "" : text.trim();
+        this.searchField.setText(completion);
+        this.searchField.setCursorPositionEnd();
+        this.suggestHighlight = -1;
+        this.suggestionsVisible = false;
+        String due = IslandSearchModel.consumeImmediateSearch(completion);
+        if (due != null) submitSearch(due);
     }
 
     private boolean moveHighlight(int delta) {
@@ -527,13 +533,8 @@ public final class IslandSearchOverlay extends ExtensionScreen implements Shared
 
         // 联想词优先（它们画在胶囊之外）。
         int suggestion = suggestionIndexAt(mouseX, mouseY);
-        if (suggestion >= 0) {
-            String completion = this.suggestions.get(suggestion).text;
-            this.searchField.setText(completion);
-            this.searchField.setCursorPositionEnd();
-            this.suggestHighlight = -1;
-            String due = IslandSearchModel.consumeImmediateSearch(completion);
-            if (due != null) submitSearch(due);
+        if (suggestion >= 0 && mouseButton == 0) {
+            acceptSearchText(this.suggestions.get(suggestion).text);
             return;
         }
 

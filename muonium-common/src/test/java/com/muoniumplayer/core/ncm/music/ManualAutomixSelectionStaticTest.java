@@ -33,6 +33,9 @@ class ManualAutomixSelectionStaticTest {
         assertFalse(request.contains("getPlayUrl()"));
         assertFalse(request.contains("player.close()"));
         assertFalse(request.contains("beginNewSession("));
+        assertTrue(request.contains("ready.song == selection.selectedSong"));
+        assertTrue(request.contains("!replaceQueue && !ready.preRolled"),
+                "a matching row number in another playlist does not identify the prepared song");
     }
 
     @Test
@@ -53,10 +56,11 @@ class ManualAutomixSelectionStaticTest {
     void pendingSelectionHasPriorityAndPauseDoesNotAutoResume() throws Exception {
         String tick = region(source(), "private void waitForPlaybackCompletion()", "private void handlePlaybackCompletion()");
         assertTrue(tick.indexOf("tryManualSelectionHandover(") < tick.indexOf("tryManualNextHandover("));
-        assertTrue(tick.indexOf("tryManualSelectionHandover(") < tick.indexOf("if (!playing.get()) break"));
+        assertTrue(tick.indexOf("tryManualSelectionHandover(") < tick.indexOf("activePlayer.isFinished()"));
         assertTrue(tick.contains("if (manualSelection != null) {"));
+        assertTrue(tick.contains("&& !pauseRequested) break"));
         String handover = region(source(), "private boolean tryManualSelectionHandover(", "private void cancelManualSelection()");
-        assertTrue(handover.contains("if (!outgoing.isFinished() && outgoing.isPausing()) return false"));
+        assertTrue(handover.contains("if (pauseRequested || !outgoing.isFinished() && outgoing.isPausing()) return false"));
         assertTrue(handover.contains("cancelArmedTrack()"));
         assertFalse(handover.contains("stopCurrentPlayback()"));
     }

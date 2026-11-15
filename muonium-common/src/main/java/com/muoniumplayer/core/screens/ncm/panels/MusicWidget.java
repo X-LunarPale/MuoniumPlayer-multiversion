@@ -31,6 +31,7 @@ import com.muoniumplayer.core.screens.ncm.TrackSelectionMotion;
 import com.muoniumplayer.core.utils.Location;
 
 import java.awt.*;
+import java.util.Locale;
 
 /**
  */
@@ -50,6 +51,7 @@ public class MusicWidget extends RoundedRectWidget {
     private boolean displaySelected;
     private double selectionEmphasis;
     private long feedbackNanos;
+    private boolean rowBadgesVisible;
 
     public PlayList playList;
     public Music music;
@@ -230,6 +232,7 @@ public class MusicWidget extends RoundedRectWidget {
         double instrumentalBadgeWidth = instrumental ? 27.0 : 0.0;
         double accessBadgeReserve = (vipRestricted ? 24.0 : 0.0) + (digitalAlbumTrack ? 28.0 : 0.0)
                 + (music.isQishui() && music.hasVipRestriction() ? 28.0 : 0.0)
+                + (music.isApple() ? 28.0 : 0.0)
                 + (cloudSong ? 28.0 : 0.0) + (showHighestQuality ? 38.0 : 0.0) + gdBadgeWidth
                 + (dolbyAtmos ? dolbyBadgeWidth + 3.0 : 0.0)
                 + (instrumental ? instrumentalBadgeWidth + 3.0 : 0.0);
@@ -242,18 +245,23 @@ public class MusicWidget extends RoundedRectWidget {
         this.addChild(lblMusicName);
 
         lblMusicName
-                .setWidthLimitType(LabelWidget.WidthLimitType.SCROLL)
+                .setWidthLimitType(LabelWidget.WidthLimitType.TRIM_TO_WIDTH)
+                .setTooltip(() -> music.getName() + (unblockBadgeText(music).isEmpty()
+                        ? "" : " · " + unblockBadgeText(music)))
                 .setBeforeRenderCallback(() -> {
                     lblMusicName.setColor(NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT));
                     lblMusicName.centerVertically();
                     lblMusicName.setPosition(cover.getRelativeX() + cover.getWidth() + 4, lblMusicName.getRelativeY() - lblMusicName.getHeight() * .5 - 2);
-                    // 为时长/操作按钮和版权徽章预留空间，确保没有徽章会与被截断的标题重叠。
-                    // 下限 40px 而不是 1px：窄面板 + 长落点徽标（已换源 · lx/哔哩哔哩）堆叠时，
-                    // 1px 下限会让歌名整条消失而徽标还占着位 —— 与其留一格尸体，不如让
-                    // 标题保住最小可读宽度，徽标（SCROLL 限宽 + 现算宽）自己向下挤压。
-                    lblMusicName.setMaxWidth(Math.max(40.0, this.getWidth() - (cover.getRelativeX() + cover.getWidth() + 4
-                            + rightActionsReserve() + (musicDirty ? (dirtyIndicatorSize + 4) : 0)
-                            + accessBadgeReserve + unblockBadgeReserve[0])));
+                    String unblock = unblockBadgeText(this.music);
+                    unblockBadgeReserve[0] = unblock.isEmpty() ? 0.0
+                            : FontManager.pf12bold.getStringWidthD(unblock) + 11.0;
+                    double allBadges = (musicDirty ? dirtyIndicatorSize + 4 : 0)
+                            + accessBadgeReserve + unblockBadgeReserve[0];
+                    double available = Math.max(0.0,
+                            this.getWidth() - lblMusicName.getRelativeX() - rightActionsReserve() - 4.0);
+                    // 窄行优先保住歌名与操作列，标签收起后仍可在标题悬浮说明中查看来源。
+                    rowBadgesVisible = canShowBadges(available, allBadges);
+                    lblMusicName.setMaxWidth(Math.max(0.0, available - (rowBadgesVisible ? allBadges : 0.0)));
                 });
         lblMusicName.setClickable(false);
 
@@ -265,7 +273,7 @@ public class MusicWidget extends RoundedRectWidget {
             vipBadge.setBeforeRenderCallback(() -> {
                 vipBadge.setRadius(2.5);
                 vipBadge.setColor(NCMScreen.getColor(NCMScreen.ColorType.ACCENT));
-                vipBadge.setAlpha(.92f);
+                vipBadge.setAlpha(rowBadgesVisible ? .92f : 0f);
                 vipBadge.setPosition(lblMusicName.getRelativeX() + lblMusicName.getWidth() + 3,
                         lblMusicName.getRelativeY() + lblMusicName.getHeight() * .5 - vipBadge.getHeight() * .5);
             });
@@ -293,8 +301,8 @@ public class MusicWidget extends RoundedRectWidget {
             this.addChild(trialBadge);
             trialBadge.setClickable(false);
             trialBadge.setBeforeRenderCallback(() -> {
-                if (!QishuiMusicService.vipContentRestrictedToTrial()
-                        && !music.isQishuiTrialResolve()) {
+                if (!rowBadgesVisible || (!QishuiMusicService.vipContentRestrictedToTrial()
+                        && !music.isQishuiTrialResolve())) {
                     trialBadge.setAlpha(0f);
                     trialText.setAlpha(0f);
                     return;
@@ -325,7 +333,7 @@ public class MusicWidget extends RoundedRectWidget {
             this.addChild(trialBadge);
             trialBadge.setClickable(false);
             trialBadge.setBeforeRenderCallback(() -> {
-                if (!music.isApplePreviewOnly()) {
+                if (!rowBadgesVisible || !music.isApplePreviewOnly()) {
                     trialBadge.setAlpha(0f);
                     trialText.setAlpha(0f);
                     return;
@@ -354,7 +362,7 @@ public class MusicWidget extends RoundedRectWidget {
             albumBadge.setBeforeRenderCallback(() -> {
                 albumBadge.setRadius(2.5);
                 albumBadge.setColor(NCMScreen.getColor(NCMScreen.ColorType.ELEMENT_HOVER));
-                albumBadge.setAlpha(.95f);
+                albumBadge.setAlpha(rowBadgesVisible ? .95f : 0f);
                 albumBadge.setPosition(lblMusicName.getRelativeX() + lblMusicName.getWidth() + 3 + albumBadgeOffset,
                         lblMusicName.getRelativeY() + lblMusicName.getHeight() * .5 - albumBadge.getHeight() * .5);
             });
@@ -377,7 +385,7 @@ public class MusicWidget extends RoundedRectWidget {
             cloudBadge.setBeforeRenderCallback(() -> {
                 cloudBadge.setRadius(2.5);
                 cloudBadge.setColor(NCMScreen.getColor(NCMScreen.ColorType.ELEMENT_HOVER));
-                cloudBadge.setAlpha(.95f);
+                cloudBadge.setAlpha(rowBadgesVisible ? .95f : 0f);
                 cloudBadge.setPosition(lblMusicName.getRelativeX() + lblMusicName.getWidth() + 3 + cloudBadgeOffset,
                         lblMusicName.getRelativeY() + lblMusicName.getHeight() * .5 - cloudBadge.getHeight() * .5);
             });
@@ -400,7 +408,7 @@ public class MusicWidget extends RoundedRectWidget {
             qualityBadge.setBeforeRenderCallback(() -> {
                 qualityBadge.setRadius(2.5);
                 qualityBadge.setColor(NCMScreen.getColor(NCMScreen.ColorType.ACCENT));
-                qualityBadge.setAlpha(.82f);
+                qualityBadge.setAlpha(rowBadgesVisible ? .82f : 0f);
                 qualityBadge.setPosition(lblMusicName.getRelativeX() + lblMusicName.getWidth() + 3 + qualityBadgeOffset,
                         lblMusicName.getRelativeY() + lblMusicName.getHeight() * .5 - qualityBadge.getHeight() * .5);
             });
@@ -422,7 +430,7 @@ public class MusicWidget extends RoundedRectWidget {
             gdBadge.setBeforeRenderCallback(() -> {
                 gdBadge.setRadius(2.5);
                 gdBadge.setColor(0x3D5AFE);
-                gdBadge.setAlpha(.92f);
+                gdBadge.setAlpha(rowBadgesVisible ? .92f : 0f);
                 gdBadge.setPosition(lblMusicName.getRelativeX() + lblMusicName.getWidth() + 3 + gdBadgeOffset,
                         lblMusicName.getRelativeY() + lblMusicName.getHeight() * .5 - gdBadge.getHeight() * .5);
             });
@@ -444,7 +452,7 @@ public class MusicWidget extends RoundedRectWidget {
             dolbyBadge.setBeforeRenderCallback(() -> {
                 dolbyBadge.setRadius(2.5);
                 dolbyBadge.setColor(0x7B4DFF);
-                dolbyBadge.setAlpha(.92f);
+                dolbyBadge.setAlpha(rowBadgesVisible ? .92f : 0f);
                 dolbyBadge.setPosition(lblMusicName.getRelativeX() + lblMusicName.getWidth() + 3 + dolbyBadgeOffset,
                         lblMusicName.getRelativeY() + lblMusicName.getHeight() * .5 - dolbyBadge.getHeight() * .5);
             });
@@ -466,7 +474,7 @@ public class MusicWidget extends RoundedRectWidget {
             instrumentalBadge.setBeforeRenderCallback(() -> {
                 instrumentalBadge.setRadius(2.5);
                 instrumentalBadge.setColor(NCMScreen.getColor(NCMScreen.ColorType.ELEMENT_HOVER));
-                instrumentalBadge.setAlpha(.95f);
+                instrumentalBadge.setAlpha(rowBadgesVisible ? .95f : 0f);
                 instrumentalBadge.setPosition(
                         lblMusicName.getRelativeX() + lblMusicName.getWidth() + 3 + instrumentalBadgeOffset,
                         lblMusicName.getRelativeY() + lblMusicName.getHeight() * .5
@@ -491,7 +499,7 @@ public class MusicWidget extends RoundedRectWidget {
                     .setColor(NCMScreen.getColor(NCMScreen.ColorType.SECONDARY_TEXT));
 
             dirtyIndicator.setBeforeRenderCallback(() -> {
-//                dirtyIndicator.centerVertically();
+                dirtyIndicator.setAlpha(rowBadgesVisible ? 1f : 0f);
                 dirtyIndicator.setPosition(lblMusicName.getRelativeX() + lblMusicName.getWidth() + 2 + dirtyBadgeOffset, lblMusicName.getRelativeY() + lblMusicName.getHeight() * .5 - dirtyIndicatorSize * .5);
             });
 
@@ -537,7 +545,7 @@ public class MusicWidget extends RoundedRectWidget {
             unblockBadge.setRadius(2.5);
             boolean unblocked = !this.music.getUnblockedSourceLabel().isEmpty();
             unblockBadge.setColor(unblocked ? 0x2E9E5B : NCMScreen.getColor(NCMScreen.ColorType.ELEMENT_HOVER));
-            unblockBadge.setAlpha(.95f);
+            unblockBadge.setAlpha(rowBadgesVisible ? .95f : 0f);
             unblockBadge.setPosition(lblMusicName.getRelativeX() + lblMusicName.getWidth() + 3 + unblockBadgeOffset,
                     lblMusicName.getRelativeY() + lblMusicName.getHeight() * .5 - unblockBadge.getHeight() * .5);
         });
@@ -548,7 +556,8 @@ public class MusicWidget extends RoundedRectWidget {
         this.addChild(lblMusicArtist);
 
         lblMusicArtist
-                .setWidthLimitType(LabelWidget.WidthLimitType.SCROLL)
+                .setWidthLimitType(LabelWidget.WidthLimitType.TRIM_TO_WIDTH)
+                .setTooltip(music.getArtistsName() + " · " + albumName)
                 .setBeforeRenderCallback(() -> {
                     if (displaySelected)
                         lblMusicArtist.setColor(NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT));
@@ -556,7 +565,8 @@ public class MusicWidget extends RoundedRectWidget {
                         lblMusicArtist.setColor(NCMScreen.getColor(NCMScreen.ColorType.SECONDARY_TEXT));
                     lblMusicArtist.centerVertically();
                     lblMusicArtist.setPosition(cover.getRelativeX() + cover.getWidth() + 4, lblMusicArtist.getRelativeY() + lblMusicArtist.getHeight() * .5 + 2);
-                    lblMusicArtist.setMaxWidth(this.getWidth() - (cover.getRelativeX() + cover.getWidth() + 4 + rightActionsReserve()));
+                    lblMusicArtist.setMaxWidth(Math.max(0.0,
+                            this.getWidth() - (cover.getRelativeX() + cover.getWidth() + 8 + rightActionsReserve())));
                 });
 
         lblMusicArtist.setClickable(false);
@@ -592,12 +602,14 @@ public class MusicWidget extends RoundedRectWidget {
         IconWidget btnAddToPlaylist = PlayerQueueIcons.newAddToPlaylistButton(20);
         this.addChild(btnAddToPlaylist);
         btnAddToPlaylist.setShouldOverrideMouseCursor(true);
+        btnAddToPlaylist.setTooltip("加入歌单");
         btnAddToPlaylist.setHidden(!playlistAddable);
         btnAddToPlaylist.setClickable(playlistAddable);
         btnAddToPlaylist.setBeforeRenderCallback(() -> {
             btnAddToPlaylist.setColor(NCMScreen.getColor(NCMScreen.ColorType.SECONDARY_TEXT));
             btnAddToPlaylist.centerVertically();
-            btnAddToPlaylist.setPosition(like.getRelativeX() - ACTION_GAP - btnAddToPlaylist.getWidth(),
+            double anchorX = likeable ? like.getRelativeX() : actionsAnchorX(lblMusicDuration);
+            btnAddToPlaylist.setPosition(anchorX - ACTION_GAP - btnAddToPlaylist.getWidth(),
                     btnAddToPlaylist.getRelativeY());
         });
         btnAddToPlaylist.setOnClickCallback((x, y, button) -> {
@@ -620,6 +632,7 @@ public class MusicWidget extends RoundedRectWidget {
         IconWidget btnPlayNext = PlayerQueueIcons.newPlayNextButton(20);
         this.addChild(btnPlayNext);
         btnPlayNext.setShouldOverrideMouseCursor(true);
+        btnPlayNext.setTooltip(() -> CloudMusic.isQueuedNext(music) ? "已加入下一首播放" : "下一首播放");
         btnPlayNext.setBeforeRenderCallback(() -> {
             boolean queued = CloudMusic.isQueuedNext(music);
             btnPlayNext.setColor(queued ? NCMScreen.getColor(NCMScreen.ColorType.ACCENT)
@@ -816,6 +829,7 @@ public class MusicWidget extends RoundedRectWidget {
     }
 
     static String formatDuration(long totalMillis) {
+        if (totalMillis <= 0) return "--:--";
         long totalSeconds = totalMillis / 1000;
 
         long hours = totalSeconds / 3600;
@@ -825,13 +839,17 @@ public class MusicWidget extends RoundedRectWidget {
         StringBuilder sb = new StringBuilder();
 
         if (hours > 0) {
-            sb.append(String.format("%02d:", hours));
+            sb.append(String.format(Locale.ROOT, "%02d:", hours));
         }
 
-        sb.append(String.format("%02d:", minutes));
-        sb.append(String.format("%02d", seconds));
+        sb.append(String.format(Locale.ROOT, "%02d:", minutes));
+        sb.append(String.format(Locale.ROOT, "%02d", seconds));
 
         return sb.toString();
+    }
+
+    static boolean canShowBadges(double available, double badgesWidth) {
+        return badgesWidth > 0.0 && available >= 80.0 + badgesWidth;
     }
 
     private boolean loadCover() {

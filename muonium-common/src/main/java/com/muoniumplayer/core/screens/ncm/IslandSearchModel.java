@@ -138,13 +138,13 @@ public final class IslandSearchModel {
      */
     public static void onInputChanged(String text, long nowMillis) {
         lastInputChangedAt = nowMillis;
-        pendingKeyword = text == null ? "" : text.trim();
-        if (pendingKeyword.length() < KEYWORD_MIN_LENGTH) {
-            searchedKeyword = "";
-            REQUEST_GATE.invalidate();
-            awaitingResults = false;
-            clearResults();
-        }
+        String keyword = text == null ? "" : text.trim();
+        if (keyword.equals(pendingKeyword)) return;
+        pendingKeyword = keyword;
+        searchedKeyword = "";
+        // 新输入已经拥有结果区；不能让旧请求在新词的防抖窗口内重新填回旧结果。
+        REQUEST_GATE.invalidate();
+        clearResults();
     }
 
     /**

@@ -244,11 +244,12 @@ class AutomixAdvancedModeStaticTest {
                 "收尾不能在调用者的线程上跑：它会和正在推进曲线的同一个 tick 抢 activeFade");
 
         // tick 消费，且排在推进曲线之前。
-        int consume = cloud.indexOf("if (seekDuringFadeRequested)");
-        int drive = cloud.indexOf("driveAutomixFade();");
+        String tick = between(cloud, "private void waitForPlaybackCompletion()", "private void handlePlaybackCompletion()");
+        int consume = tick.indexOf("if (seekDuringFadeRequested)");
+        int drive = tick.indexOf("driveAutomixFade();");
         assertTrue(consume >= 0 && consume < drive,
                 "同一 tick 里先推进再收尾，等于明知这次作废还要照旧曲线多写一帧");
-        assertTrue(cloud.substring(consume, consume + 160).contains("finishAutomixFade();"));
+        assertTrue(tick.substring(consume, consume + 160).contains("finishAutomixFade();"));
     }
 
     @Test

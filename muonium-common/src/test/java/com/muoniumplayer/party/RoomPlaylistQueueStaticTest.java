@@ -199,12 +199,25 @@ class RoomPlaylistQueueStaticTest {
                 "「排进房间」不许用 setHidden 控制显隐：隐藏后回调停跑，进房也救不回来");
         assertTrue(body.contains("partyFade[0]"),
                 "显隐走 alpha 淡入淡出，进房后按钮自己长出来，不惊动正在翻的歌单");
+        assertTrue(body.contains("btnParty.setAlpha(partyFade[0])"),
+                "淡入进度必须真正写回按钮透明度");
+        assertTrue(body.contains("btnParty.setClickable(show && MpPartyClient.canPlaylist())"),
+                "退出房间要立即停止响应；支持功能但没有权限时也不能误接点击");
 
         String coverflow = region(panel, "RoundedButtonWidget btnCoverflow",
                 "btnCoverflow.setOnClickCallback");
-        assertTrue(coverflow.contains("partyFade[0]"),
-                "链式定位按淡出进度连续过渡：那一颗收起来时后面那排平滑顶回原位，"
-                        + "不按布尔跳变瞬移、也不留一块空");
+        assertTrue(body.contains("placeHeaderAction(btnParty, toolbar")
+                        && body.contains("show || partyFade[0] > .02f")
+                        && coverflow.contains("placeHeaderAction(btnCoverflow, toolbar"),
+                "淡出期间保留槽位，收起后同一排版器重新排列后续按钮，不能重叠或永久留空");
+        String placement = region(panel, "private static void placeHeaderAction",
+                "private void buildPendingMusicWidgets");
+        int absent = placement.indexOf("if (!visible)");
+        int noBounds = placement.indexOf("widget.setBounds(0, 0)", absent);
+        int stop = placement.indexOf("return;", noBounds);
+        int nextSlot = placement.indexOf("toolbar.next(width)");
+        assertTrue(absent >= 0 && noBounds > absent && stop > noBounds && nextSlot > stop,
+                "不可见动作必须先清空命中框并退出，不能再领取一格让后续按钮留洞");
     }
 
     @Test

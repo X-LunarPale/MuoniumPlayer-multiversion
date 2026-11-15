@@ -31,8 +31,8 @@ public class AudioPlayer {
         RELEASE_WORKER.execute(release);
     }
 
-    public SoundFile player;
-    public Runnable afterPlayed;
+    public volatile SoundFile player;
+    public volatile Runnable afterPlayed;
 
     /**
      * 播放音量。渲染线程（音量滑块逐帧 {@code setVolume}）写、JSyn 音频线程
@@ -129,110 +129,97 @@ public class AudioPlayer {
         this.closed = false;
     }
 
-    public void setAudio(File file) {
+    public synchronized void setAudio(File file) {
         // 在关掉当前正在播放的歌曲之前先解码并校验：
         // 损坏或为空的替换曲绝不能毁掉原本还能用的播放器。
         SoundFile next = loadUsableSoundFile(file);
-        next.setOnFinished(() -> finished = true);
-
-        releaseAutomixChain();
-        // 换曲：声场修饰的滤波器与延迟线里还留着上一首的余音，一并清掉。
-        com.muoniumplayer.core.ncm.music.acoustics.AcousticsRuntime.onTrackChanged();
         SoundFile previous = this.player;
-        this.player = next;
-        finished = false;
-        this.closed = false;
-        this.replacementStopped = false;
-        this.prepared = false;
-        // 新曲目还没有被要求播放。此刻 deck 上挂的是上一首的播放意图，
-        // 留着它会让界面在新曲真正起播之前就报告「正在播放」——正是本次要修的那个错。
-        // 新曲目已真正起播——正是本次改动所要修正的那种不匹配。
-        this.playRequested = false;
-        this.bassGainDb = 0.0f;
-        this.vocalDuckDepth = 0.0f;
-        this.playbackRate = 1.0f;
-        this.pitchRatio = 1.0f;
-        this.pitchPreserved = false;
-        // 交叉淡入的增益必须一起归位。fadeGain 属于某一次转场，不属于这个 deck：
-        // 淡出侧会被压到 0，预卷（pre-roll）的 deck 也从 0 起步。如果那次转场被打断
-        // （被抢先的切歌、队列版本变化、一起听房间中途换歌），只有 incoming == ownedPlayer
-        // 这一种情形会被还原成 1；其余情况这个 deck 带着 0 活下来，随后又可能被提升成
-        // 活动播放器。那时 setAudio() 换上新曲，effectiveAmp() = volume * 0 —— 下载正常、
-        // 解码正常、进度条正常走，就是一点声音都没有，而且不报任何错。
-        this.fadeGain = 1.0f;
-        this.sourceFile = file;
+        synchronized (previous == null ? this : previous) {
+            releaseAutomixChain();
+            com.muoniumplayer.core.ncm.music.acoustics.AcousticsRuntime.onTrackChanged();
+            this.player = next;
+            finished = false;
+            this.closed = false;
+            this.replacementStopped = false;
+            this.prepared = false;
+            this.playRequested = false;
+            this.bassGainDb = 0.0f;
+            this.vocalDuckDepth = 0.0f;
+            this.playbackRate = 1.0f;
+            this.pitchRatio = 1.0f;
+            this.pitchPreserved = false;
+            // Transition gain belongs to the old track and must not silence its replacement.
+            this.fadeGain = 1.0f;
+            this.sourceFile = file;
+            setListeners();
+        }
         dispose(previous);
     }
 
     public void setListeners() {
-        if (player != null)
-            player.setOnFinished(() -> finished = true);
+        SoundFile observed = player;
+        if (observed != null) {
+            observed.setOnFinished(() -> {
+                if (player != observed || closed || replacementStopped || !playRequested) return;
+                finished = true;
+                playRequested = false;
+                Runnable callback = afterPlayed;
+                if (callback != null) callback.run();
+            });
+        }
     }
 
     public void play() {
-        if (!isUsable())
-            return;
+        SoundFile current = this.player;
+        if (current == null) return;
+        synchronized (current) {
+            if (this.player != current || !isUsable()) return;
+            // SoundFile.play() clones an already running voice. Deduplicate pending commands too.
+            if (this.playRequested || this.player.isPlaying()) {
+                this.playRequested = true;
+                return;
+            }
 
-        // 已经在出声就不再命令它播放第二次。AudioSample.play() 对「自己已在播放」的采样
-        // 会克隆出一路新读头（getUnusedPlayer），而克隆对象没有任何句柄留在外面 ——
-        // pause()/close() 都只停得住原本那一路，多出来的那路会一直响到曲子结束。
-        // 暂停/播放键被反复点按时叠出的第二层、第三层音就是这么来的。
-        if (this.player.isPlaying()) {
+            attachAutomixChain();
+
+            finished = false;
+            // Publish the intent before the audio thread consumes its command.
             this.playRequested = true;
-            return;
-        }
-
-        attachAutomixChain();
-
-        finished = false;
-        // 先置位再排队：这条命令之后无论引擎线程什么时候才处理，界面都已经知道
-        // 「这一路 deck 是被要求播放的」，不必等 isPlaying() 翻真。
-        this.playRequested = true;
-        try {
-            // 先调振幅：让播放从配置好的电平起步，
-            // 而不是头几帧按引擎默认的满音量渲染。
-            this.player.amp(effectiveAmp());
-            this.player.play();
-            this.player.amp(effectiveAmp());
-        } catch (ChannelMismatchException mismatch) {
-            // 为声道变化保留 CloudMusic 里既有的重试路径。
-            this.playRequested = false;
-            throw mismatch;
-        } catch (RuntimeException ignored) {
-            // 解码器在校验与播放之间可能失效。
-            this.playRequested = false;
+            try {
+                this.player.amp(effectiveAmp());
+                this.player.play();
+                this.player.amp(effectiveAmp());
+            } catch (ChannelMismatchException mismatch) {
+                this.playRequested = false;
+                throw mismatch;
+            } catch (RuntimeException ignored) {
+                this.playRequested = false;
+            }
         }
     }
 
     @SneakyThrows
     public void setPlaybackTime(float millis) {
-        if (!isUsable())
-            return;
-
-        float total = getTotalTimeMillis();
-        if (total <= 0.0f)
-            return;
-
-        float safeMillis = Math.max(0.0f, Math.min(total, millis));
-        try {
-            // 暂停中挪进度只许挪读头，绝不许出声。AudioSample.jump() 的契约是
-            // 「跳转并继续播放，没在播就开播」：暂停时它会把这一路重新接回引擎开始出声，
-            // 而播放意图（playRequested）仍是 false —— 界面照旧画着播放键，用户再按一下
-            // 又会在「已在播放」的采样上触发第二次 play()，克隆出一路停不掉的读头（叠音）。
-            // 暂停态要的是 cue()：同样把读头放到目标位置，但保持静音，等真正的 play()
-            // 从那里续上。判据用播放意图而不是引擎瞬时状态：play() 命令排队后到引擎真正
-            // 开播之间有一个窗口，那里意图已是要播、引擎还没动，此时拖动进度条必须继续播。
-            if (this.playRequested) {
-                this.player.jump(safeMillis / 1000F);
-            } else {
-                this.player.cue(safeMillis / 1000F);
+        SoundFile current = this.player;
+        if (current == null) return;
+        synchronized (current) {
+            if (this.player != current || !isUsable()) return;
+            float total = getTotalTimeMillis();
+            if (total <= 0.0f) return;
+            float safeMillis = Math.max(0.0f, Math.min(total, millis));
+            try {
+                // Decide and seek under the pause lock: jump() starts a silent sample.
+                if (this.playRequested) {
+                    this.player.jump(safeMillis / 1000F);
+                } else {
+                    this.player.cue(safeMillis / 1000F);
+                }
+                this.player.resyncTimeStretch();
+                this.player.amp(effectiveAmp());
+                com.muoniumplayer.core.ncm.music.acoustics.AcousticsRuntime.onTrackChanged();
+            } catch (RuntimeException ignored) {
+                // 定位是尽力而为。畸形流绝不能让界面崩溃。
             }
-            this.player.resyncTimeStretch();
-            this.player.amp(effectiveAmp());
-            // 拖进度后声音内容不连续了：声场里的余音一并作废，否则旧句的尾巴会叠在新句上。
-            com.muoniumplayer.core.ncm.music.acoustics.AcousticsRuntime.onTrackChanged();
-        } catch (RuntimeException ignored) {
-            // 定位是尽力而为。畸形流绝不能让界面崩溃。
         }
     }
 
@@ -244,27 +231,25 @@ public class AudioPlayer {
      * 而不是再分配第二个并发的 voice。</p>
      */
     public void playFrom(float millis) {
-        if (!isUsable())
-            return;
-
-        finished = false;
-        this.playRequested = true;
-        try {
-            this.player.amp(effectiveAmp());
-            cueTo(millis);
-            // 要在 cue() 之后、绝不能在它之前：AudioSample.cue() 会走 stop()，
-            // 把效果从电路里扯掉且不再装回（JSyn 的 Processing 包装层对此有自己的 TODO）。
-            // 先接链的话，淡化中进来的 deck 会完全不经滤波地播放——
-            // 两首曲子都保留完整低频，接缝处就会咚地撞一下。
-            attachAutomixChain();
-            this.player.play();
-            this.player.amp(effectiveAmp());
-        } catch (ChannelMismatchException mismatch) {
-            this.playRequested = false;
-            throw mismatch;
-        } catch (RuntimeException ignored) {
-            // 解码器在校验与播放之间可能失效。
-            this.playRequested = false;
+        SoundFile current = this.player;
+        if (current == null) return;
+        synchronized (current) {
+            if (this.player != current || !isUsable()) return;
+            finished = false;
+            this.playRequested = true;
+            try {
+                this.player.amp(effectiveAmp());
+                cueTo(millis);
+                // cue() removes the old effect graph; attach the chain after seeking.
+                attachAutomixChain();
+                this.player.play();
+                this.player.amp(effectiveAmp());
+            } catch (ChannelMismatchException mismatch) {
+                this.playRequested = false;
+                throw mismatch;
+            } catch (RuntimeException ignored) {
+                this.playRequested = false;
+            }
         }
     }
 
@@ -281,16 +266,21 @@ public class AudioPlayer {
      * 
      */
     public void prepareStart(float millis) {
-        if (!isUsable()) return;
-        try {
-            finished = false;
-            this.player.amp(0.0f);
-            float cued = cueTo(millis);
-            attachAutomixChain();
-            primeStreamWindow(cued);
-            this.prepared = true;
-        } catch (RuntimeException ignored) {
-            this.prepared = false;
+        SoundFile current = this.player;
+        if (current == null) return;
+        synchronized (current) {
+            if (this.player != current || !isUsable()) return;
+            try {
+                finished = false;
+                this.playRequested = false;
+                this.player.amp(0.0f);
+                float cued = cueTo(millis);
+                attachAutomixChain();
+                primeStreamWindow(cued);
+                this.prepared = true;
+            } catch (RuntimeException ignored) {
+                this.prepared = false;
+            }
         }
     }
 
@@ -299,28 +289,32 @@ public class AudioPlayer {
      * 会停掉读头、把低搁架再扯出来，并丢掉已预热的窗口。
      */
     public void startPrepared() {
-        if (!isUsable()) return;
+        SoundFile current = this.player;
+        if (current == null) return;
         if (!this.prepared) {
             play();
             return;
         }
-        // 与 play() 同一条防线：已经在出声的采样再收一次 play() 会克隆出没人持有的第二路读头。
-        if (this.player.isPlaying()) {
+        synchronized (current) {
+            if (this.player != current || !isUsable()) return;
+            // 与 play() 同一条防线：已经在出声的采样再收一次 play() 会克隆出没人持有的第二路读头。
+            if (this.playRequested || this.player.isPlaying()) {
+                this.playRequested = true;
+                return;
+            }
+            finished = false;
             this.playRequested = true;
-            return;
-        }
-        finished = false;
-        this.playRequested = true;
-        try {
-            this.player.amp(effectiveAmp());
-            attachAutomixChain();   // 幂等；这条链通常从 prepareStart() 起就一直活着。
-            this.player.play();
-            this.player.amp(effectiveAmp());
-        } catch (ChannelMismatchException mismatch) {
-            this.playRequested = false;
-            throw mismatch;
-        } catch (RuntimeException ignored) {
-            this.playRequested = false;
+            try {
+                this.player.amp(effectiveAmp());
+                attachAutomixChain();   // 幂等；这条链通常从 prepareStart() 起就一直活着。
+                this.player.play();
+                this.player.amp(effectiveAmp());
+            } catch (ChannelMismatchException mismatch) {
+                this.playRequested = false;
+                throw mismatch;
+            } catch (RuntimeException ignored) {
+                this.playRequested = false;
+            }
         }
     }
 
@@ -809,12 +803,7 @@ public class AudioPlayer {
 
     public void setAfterPlayed(Runnable runnable) {
         this.afterPlayed = runnable;
-        if (this.player != null)
-            this.player.setOnFinished(() -> {
-                finished = true;
-                if (runnable != null)
-                    runnable.run();
-            });
+        setListeners();
     }
 
     public float getTotalTimeSeconds() {
@@ -891,13 +880,20 @@ public class AudioPlayer {
     public void pause() {
         // 意图与引擎一起停下。先清意图：否则在引擎真正停住之前，界面会有一段
         // 「已按暂停、图标却还是播放」的反向错位，和本次修的是同一个量。
-        this.playRequested = false;
-        if (isUsable()) {
-            try {
-                this.player.pause();
-            } catch (RuntimeException ignored) {
-                // 忽略畸形的解码器状态。
+        SoundFile current = this.player;
+        if (current != null) {
+            synchronized (current) {
+                if (this.player != current) return;
+                this.playRequested = false;
+                if (!isUsable()) return;
+                try {
+                    this.player.pause();
+                } catch (RuntimeException ignored) {
+                    // 忽略畸形的解码器状态。
+                }
             }
+        } else {
+            this.playRequested = false;
         }
     }
 
