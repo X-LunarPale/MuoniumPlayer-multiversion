@@ -1273,6 +1273,10 @@ public class CloudMusic implements SharedConstants {
             if (selection != null && owner.isSessionUsable(selection.session)) {
                 return new PlaybackPresentation(audible, selection.selectedSong, selection.requestNanos);
             }
+            PlaybackSession activeSession = owner.session;
+            if (owner.hasTransportIntent() && (activeSession == null || !activeSession.audioActive)) {
+                return new PlaybackPresentation(audible, owner.preparingSong, owner.preparationRequestedNanos);
+            }
         }
         return new PlaybackPresentation(audible, null, 0L);
     }
@@ -1317,30 +1321,34 @@ public class CloudMusic implements SharedConstants {
         if (party == 1) return PlayPauseResult.PAUSED;
         if (party == 2) return PlayPauseResult.RESUMED;
         if (party == 3) return PlayPauseResult.UNAVAILABLE;
-        AudioPlayer activePlayer = player;
-        // 播放记忆恢复态：队列和当前歌都在、引擎没出声、还有没用掉的续播偏移——
-        // 这一下「播放」的语义就是「接着上次的位置放」。不处理的话按钮是死的
-        // （下面那道 UNAVAILABLE 闸把它拦住），用户得自己去队列里把那首歌找出来点一遍。
-        // startPlaybackList 会消费偏移、从保存的位置起播；失败时回落 UNAVAILABLE 语义。
-        if (activePlayer == null && currentlyPlaying != null && pendingResumeOffsetMillis >= 0L
-                && !playList.isEmpty() && curIdx >= 0 && curIdx < playList.size()) {
-            // 用户在恢复态动过 curIdx（prev/next）时偏移可能已不属于 curIdx 这一首——
-            // startPlayback 的 clamp 会把它兜进新歌的时长内，顶多接近曲尾，可接受；
-            // 比把按钮卡死强。startPlaybackList 内部消费偏移，之后本闸不再触发。
-            startPlaybackList(playList, curIdx);
-            return PlayPauseResult.RESUMED;
-        }
-        if (currentlyPlaying == null || activePlayer == null || activePlayer.isFinished()) {
-            return PlayPauseResult.UNAVAILABLE;
-        }
-        if (activePlayer.isPausing()) {
-            activePlayer.unpause();
+        synchronized (PLAYER_STATE_LOCK) {
+            Thread owner = playThread;
+            if (owner instanceof PlayThread) {
+                PlayPauseResult result = ((PlayThread) owner).togglePauseIntent();
+                if (result != PlayPauseResult.UNAVAILABLE) {
+                    notePlaybackEvent();
+                    return result;
+                }
+            }
+            AudioPlayer activePlayer = player;
+            // A restored queue resumes only after an explicit play request.
+            if (activePlayer == null && currentlyPlaying != null && pendingResumeOffsetMillis >= 0L
+                    && !playList.isEmpty() && curIdx >= 0 && curIdx < playList.size()) {
+                startPlaybackList(playList, curIdx);
+                return PlayPauseResult.RESUMED;
+            }
+            if (currentlyPlaying == null || activePlayer == null || activePlayer.isFinished()) {
+                return PlayPauseResult.UNAVAILABLE;
+            }
+            if (activePlayer.isPausing()) {
+                activePlayer.unpause();
+                notePlaybackEvent();
+                return PlayPauseResult.RESUMED;
+            }
+            activePlayer.pause();
             notePlaybackEvent();
-            return PlayPauseResult.RESUMED;
+            return PlayPauseResult.PAUSED;
         }
-        activePlayer.pause();
-        notePlaybackEvent();
-        return PlayPauseResult.PAUSED;
     }
 
     /** {@link #togglePlayPause()} 的结果，供界面与快捷键决定要不要给反馈。 */
@@ -1830,6 +1838,10 @@ public class CloudMusic implements SharedConstants {
         private final AtomicBoolean cancelled = new AtomicBoolean(false);
         private volatile PlaybackSession session;
         private volatile AudioPlayer ownedPlayer;
+        /** User pause survives URL resolution, decoding and a pending track handover. */
+        private volatile boolean pauseRequested;
+        private volatile Music preparingSong;
+        private volatile long preparationRequestedNanos = System.nanoTime();
         /** 下一首曲目已解码完成，正在空闲播放牌上静默等待。 */
         private volatile ArmedTrack armed;
         /** 点击只提交意图；下载/解码不占用 UI、监督 tick 或低优先级分析队列。 */
@@ -1914,6 +1926,38 @@ public class CloudMusic implements SharedConstants {
             this.setName("Play Thread");
             this.startIdx = startIdx;
             this.startOffsetMillis = Math.max(0L, startOffsetMillis);
+            this.preparingSong = songs != null && startIdx >= 0 && startIdx < songs.size()
+                    ? songs.get(startIdx) : null;
+        }
+
+        private boolean hasTransportIntent() {
+            PlaybackSession activeSession = session;
+            return playThread == this && !isPlaybackCancelled() && !doBreak && !playListChanged()
+                    && !awaitingPlaybackAction && getState() != Thread.State.TERMINATED
+                    && (activeSession == null || activeSession.isActive());
+        }
+
+        private PlayPauseResult togglePauseIntent() {
+            if (!hasTransportIntent()) return PlayPauseResult.UNAVAILABLE;
+            AudioPlayer active = ownedPlayer;
+            boolean audioStarted = session != null && session.audioActive;
+            if (audioStarted && active != null && active.isUsable() && !active.isFinished()) {
+                pauseRequested = !active.isPausing();
+            } else {
+                pauseRequested = !pauseRequested;
+            }
+            if (active != null && active.isUsable() && !active.isFinished()) {
+                if (pauseRequested) active.pause();
+                else if (audioStarted) active.unpause();
+            }
+            // Both audible decks must stop before returning to the input handler.
+            driveAutomixFade();
+            ArmedTrack prepared = armed;
+            if (pauseRequested && prepared != null && prepared.preRolled && prepared.deck != null) {
+                prepared.deck.pause();
+                prepared.preRollPaused = true;
+            }
+            return pauseRequested ? PlayPauseResult.PAUSED : PlayPauseResult.RESUMED;
         }
 
         /**
@@ -2137,6 +2181,8 @@ public class CloudMusic implements SharedConstants {
                 if (isPlaybackCancelled() || playThread != this || playListChanged()) return false;
                 session = CloudMusic.beginNewSession(song);
                 currentlyPlaying = song;
+                preparingSong = song;
+                preparationRequestedNanos = System.nanoTime();
             }
             // 起播即销账：这一首已经轮到它播了，用户为它点的那次"下一首播放"到此兑现。
             noteQueuedTrackStarted(song);
@@ -2546,7 +2592,7 @@ public class CloudMusic implements SharedConstants {
 
                 // 在交接尝试之后检查，这样刚结束的曲目仍可以交接给已预备的
                 // 播放牌，而不是退回到关闭/下载/解码的空档。
-                if (!playing.get()) break;
+                if ((!playing.get() || activePlayer.isFinished()) && !pauseRequested) break;
 
                 try {
                     Thread.sleep(10L);
@@ -2652,7 +2698,9 @@ public class CloudMusic implements SharedConstants {
             try {
                 synchronized (PLAYER_STATE_LOCK) {
                     if (!isSessionUsable(targetSession) || ownedPlayer != activePlayer) return false;
-                    if (offset > 0L) {
+                    if (pauseRequested) {
+                        activePlayer.prepareStart((float) offset);
+                    } else if (offset > 0L) {
                         // automix 交接同一条 playFrom 路径（cue 后 play 复用同一 voice）。
                         // clamp 到曲长：快照里的位置可能长于试听片段/损坏文件的实际时长。
                         float total = activePlayer.getTotalTimeMillis();
@@ -2665,6 +2713,10 @@ public class CloudMusic implements SharedConstants {
                     } else {
                         activePlayer.play();
                     }
+                    if (!pauseRequested && activePlayer.isPausing()) {
+                        throw new IllegalStateException("音频设备未接受播放，请重试或检查输出设备");
+                    }
+                    targetSession.audioActive = true;
                     playing.set(true);
                 }
             } catch (ChannelMismatchException mismatch) {
@@ -3642,7 +3694,8 @@ public class CloudMusic implements SharedConstants {
                     // 计算路径上这条复查在规划器里（FoliaAutomixPlanner 的 5 秒余量），复用路径补在这里。
                     if (track.plan != null && ownedPlayer != null) {
                         long playhead = (long) ownedPlayer.getCurrentTimeMillis();
-                        if (track.plan.fireMillis < playhead + REUSED_PLAN_FIRE_LEAD_MILLIS) {
+                        if (track.plan.fireMillis < playhead + REUSED_PLAN_FIRE_LEAD_MILLIS
+                                || !track.plan.staysWithinTail((long) ownedPlayer.getTotalTimeMillis())) {
                             System.out.println("[Automix] 复用计划已过期：fire " + track.plan.fireMillis
                                     + " < 播放头 " + playhead + " + " + REUSED_PLAN_FIRE_LEAD_MILLIS
                                     + "，改为重算");
@@ -4283,7 +4336,8 @@ public class CloudMusic implements SharedConstants {
                 ManualSelection selection = new ManualSelection(queue, index, replaceQueue, session);
                 // 点击的正好是已解码的下一首时直接复用备用轨，不能因「视觉上先选中」而退化成重新下载。
                 ArmedTrack ready = armed;
-                if (ready != null && ready.index == index && !ready.preRolled
+                if (ready != null && ready.index == index && ready.song == selection.selectedSong
+                        && !replaceQueue && !ready.preRolled
                         && ready.deck != null && ready.deck.isUsable()
                         && armStillValid(ready.generation, ready.queueRevision)) {
                     armed = null;
@@ -4321,6 +4375,10 @@ public class CloudMusic implements SharedConstants {
 
         /** 不等模型、stem、节拍或队尾：只做新歌出声所需的取流、解码和首窗口预热。 */
         private void prepareManualSelection(ManualSelection selection) {
+            if (selection.ready != null) {
+                selection.worker = null;
+                return;
+            }
             AudioPlayer deck = null;
             Music song = selection.selectedSong;
             try {
@@ -4461,7 +4519,7 @@ public class CloudMusic implements SharedConstants {
                 ArmedTrack track = selection.ready;
                 if (track == null) return false;
                 // 加载期间用户按了暂停，准备好的新歌也等用户恢复，不能自行开始出声。
-                if (!outgoing.isFinished() && outgoing.isPausing()) return false;
+                if (pauseRequested || !outgoing.isFinished() && outgoing.isPausing()) return false;
                 if (!selection.replaceQueue) {
                     int index = songs.indexOf(selection.selectedSong);
                     if (index < 0) {
@@ -4626,11 +4684,16 @@ public class CloudMusic implements SharedConstants {
                 cancelArmedTrack();
                 return false;
             }
+            if (!track.roomMode
+                    && !track.plan.staysWithinTail((long) activePlayer.getTotalTimeMillis())) {
+                cancelArmedTrack();
+                return false;
+            }
             long position = (long) activePlayer.getCurrentTimeMillis();
             boolean ended = activePlayer.isFinished() || !playing.get();
             // 暂停中的曲目不得交接：进入的播放牌会自行开始发声
             // 而界面仍显示播放处于暂停状态。
-            if (!ended && activePlayer.isPausing()) return false;
+            if (pauseRequested || !ended && activePlayer.isPausing()) return false;
             // 一起听房间：服务端的换歌帧就是交叠起点。各端本地位置与房间时钟之间有几十毫秒
             // 抖动，按本地位置推算会让「帧先到还是本机先到」变成掷硬币 —— 而帧先到的那一刻这
             // 里还没触发，随后那记 S_PLAY 会把刚叠上的尾巴整段掐掉。所以帧到了就立刻交接。
@@ -4741,6 +4804,7 @@ public class CloudMusic implements SharedConstants {
             PlaybackSession nextSession;
             synchronized (PLAYER_STATE_LOCK) {
                 if (!isSessionUsable(session) || ownedPlayer != outgoing
+                        || pauseRequested || !outgoing.isFinished() && outgoing.isPausing()
                         || (selection == null ? manualSelection != null : manualSelection != selection)) {
                     closeQuietly(incoming);
                     return false;
@@ -4890,60 +4954,51 @@ public class CloudMusic implements SharedConstants {
          * 永远不依赖它。</p>
          */
         private void driveAutomixFade() {
-            AutomixFade fade = activeFade;
-            if (fade == null) return;
+            synchronized (PLAYER_STATE_LOCK) {
+                AutomixFade fade = activeFade;
+                if (fade == null) return;
 
-            long now = System.currentTimeMillis();
-            AudioPlayer active = ownedPlayer;
-            boolean paused = active != null && active.isUsable() && !active.isFinished() && active.isPausing();
-            if (paused) {
-                AutomixTransitionAnimation.setPaused(true);
-                // 保持渐变，而不是让挂钟时间在暂停期间继续流逝，并将
-                // 退出播放牌随活动播放牌一起关闭——播放器中没有其他部分知道它的存在。
-                fade.startedAt += Math.max(0L, now - fade.tickedAt);
-                fade.tickedAt = now;
-                // 将 startedAt 平移空闲间隔正是让 now - startedAt 成为
-                // 被保持的已用时间的做法，因此这是音频任务必须停留在其上的冻结进度。
-                fade.pausedProgress = progressAt(fade, now);
-                if (!fade.outgoingPaused && fade.outgoing != null && fade.outgoing.isUsable()
-                        && !fade.outgoing.isPausing()) {
-                    fade.outgoing.pause();
-                    fade.outgoingPaused = true;
+                long now = System.currentTimeMillis();
+                AudioPlayer active = ownedPlayer;
+                boolean paused = pauseRequested
+                        || active != null && active.isUsable() && !active.isFinished() && active.isPausing();
+                if (paused) {
+                    AutomixTransitionAnimation.setPaused(true);
+                    // Keep the fade clock and both audible decks still until the user resumes.
+                    fade.startedAt += Math.max(0L, now - fade.tickedAt);
+                    fade.tickedAt = now;
+                    fade.pausedProgress = progressAt(fade, now);
+                    if (!fade.outgoingPaused && fade.outgoing != null && fade.outgoing.isUsable()
+                            && !fade.outgoing.isPausing()) {
+                        fade.outgoing.pause();
+                        fade.outgoingPaused = true;
+                    }
+                    return;
                 }
-                return;
-            }
-            AutomixTransitionAnimation.setPaused(false);
-            if (fade.outgoingPaused && fade.outgoing != null) {
-                // 仅当本次淡出是暂停它的那次淡出时才恢复：unpause() 会重新启动一个
-                // 自行停止的播放牌从其入点位置继续，这会导致重新播放
-                // 退出曲目从头开始。
-                fade.outgoing.unpause();
-                fade.outgoingPaused = false;
-            }
-            fade.pausedProgress = -1.0;
-            fade.tickedAt = now;
+                AutomixTransitionAnimation.setPaused(false);
+                if (fade.outgoingPaused && fade.outgoing != null) {
+                    // Resume only the outgoing deck paused by this fade.
+                    fade.outgoing.unpause();
+                    fade.outgoingPaused = false;
+                }
+                fade.pausedProgress = -1.0;
+                fade.tickedAt = now;
 
-            double progress = progressAt(fade, now);
-            if (now - fade.audioDrivenAt >= AUDIO_DRIVEN_WINDOW_MILLIS) {
-                // 最近没有音频任务写入过帧——从未注册、抛出异常，或者引擎
-                // 已经消失——因此完全像它存在之前那样回退到 tick。
-                writeTransitionFrame(fade, progress);
-            }
-            if (progress < 1.0) return;
+                double progress = progressAt(fade, now);
+                if (now - fade.audioDrivenAt >= AUDIO_DRIVEN_WINDOW_MILLIS) {
+                    writeTransitionFrame(fade, progress);
+                }
+                if (progress < 1.0) return;
 
-            // 在下面将播放牌扁平化之前清除。音频任务已经在处理中的帧
-            // 最坏情况下会重写计划自身的结束状态——对于进入播放牌来说，这个状态是
-            // 完全平坦的——而且它是直接的端口写入，而下面的重置则通过
-            // 命令队列进行，因此在它之后才被排空。
-            activeFade = null;
-            unregisterAutomixAudioTask();
-            if (fade.incoming != null) {
-                fade.incoming.setFadeGain(1.0f);
-                // 曲目剩余部分采用平坦响应和自然速度：混音不留下任何痕迹
-                // 可能会延续到普通播放中。
-                fade.incoming.resetAutomixProcessing();
+                // A late audio frame must observe the plan's neutral endpoint.
+                activeFade = null;
+                unregisterAutomixAudioTask();
+                if (fade.incoming != null) {
+                    fade.incoming.setFadeGain(1.0f);
+                    fade.incoming.resetAutomixProcessing();
+                }
+                releaseFadedDeck(fade.outgoing);
             }
-            releaseFadedDeck(fade.outgoing);
         }
 
         /** 在 {@code now} 处的渐变位置，以渐变长度计；计划本身会对越界值做截断。 */
@@ -5743,6 +5798,24 @@ public class CloudMusic implements SharedConstants {
         if (LiveStreamSession.isActive()) return LiveStreamSession.isPlaying();
         AudioPlayer active = player;
         return active != null && !active.isPausing();
+    }
+
+    /** Playback intent also covers URL resolution and decoding before a deck can make sound. */
+    public static boolean transportPlaying() {
+        if (SpotifyConnectMirror.isMirroring() || ExternalPlayback.isMirroring()
+                || LiveStreamSession.isActive()) return isAudibleNow();
+        Thread active = playThread;
+        if (active instanceof PlayThread) {
+            PlayThread owner = (PlayThread) active;
+            if (owner.hasTransportIntent()) {
+                if (owner.pauseRequested) return false;
+                PlaybackSession activeSession = owner.session;
+                AudioPlayer deck = owner.ownedPlayer;
+                return activeSession == null || !activeSession.audioActive || deck == null
+                        || deck.isFinished() || !deck.isPausing();
+            }
+        }
+        return isAudibleNow();
     }
 
     /**

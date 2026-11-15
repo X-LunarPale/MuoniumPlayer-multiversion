@@ -83,6 +83,12 @@ public class PlayList {
      */
     private transient boolean localPlaylist;
     public transient volatile boolean musicsQueried = false, musicsLoaded = false;
+    private transient volatile String musicLoadError = "";
+
+    public String getMusicLoadError() {
+        String error = musicLoadError;
+        return error == null ? "" : error;
+    }
 
     public final Location getCoverLocation() {
         String source = getPlatform().name().toLowerCase(java.util.Locale.ROOT);
@@ -109,6 +115,7 @@ public class PlayList {
             currentMusics = this.musics;
             if (!this.musicsQueried && !searchMode) {
                 this.musicsQueried = true;
+                this.musicLoadError = "";
                 startQuery = true;
             }
         }
@@ -133,12 +140,14 @@ public class PlayList {
         List<Music> alreadyLoaded = null;
         synchronized (this) {
             ensureMusicsList();
-            if (this.musicsLoaded || (searchMode && !this.musics.isEmpty())) {
+            if (this.musicsLoaded || searchMode) {
+                this.musicsLoaded = true;
                 alreadyLoaded = this.musics;
             } else {
                 getMusicLoadCallbacks().add(callback);
                 if (!this.musicsQueried && !searchMode) {
                     this.musicsQueried = true;
+                    this.musicLoadError = "";
                     startQuery = true;
                 }
             }
@@ -179,7 +188,11 @@ public class PlayList {
         synchronized (this) {
             callbacks = new ArrayList<>(getMusicLoadCallbacks());
             getMusicLoadCallbacks().clear();
-            result = this.musics;
+            result = new ArrayList<>(this.musics);
+            // 先分离本轮监听器，再允许失败重试，避免新一轮回调被旧查询取走。
+            if (!this.musicsLoaded) {
+                this.musicsQueried = false;
+            }
         }
 
         if (callbacks.isEmpty()) {
@@ -332,12 +345,15 @@ public class PlayList {
                 ensureMusicsList();
                 this.musics.clear();
                 this.musics.addAll(loadedMusics);
+                this.musicLoadError = "";
                 this.musicsLoaded = true;
             }
         } catch (Exception e) {
             synchronized (this) {
-                this.musicsQueried = false;
                 this.musicsLoaded = false;
+                String reason = e.getMessage();
+                this.musicLoadError = reason == null || reason.trim().isEmpty()
+                        ? "曲目加载失败，请重试" : reason;
             }
             e.printStackTrace();
         }

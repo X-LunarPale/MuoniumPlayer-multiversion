@@ -313,7 +313,9 @@ final class FoliaAutomixPlanner {
         // 播放头之后至少留出这些毫秒才允许当退场点。计划会被 AutomixPlanCache 按「这一对歌」
         // 复用，同一对第二次播放时预备可能比第一次晚几秒——不留余量就会复用一个「已经过去了」
         // 的退场点，交接当场开始，听起来像在中段硬切。
-        request.minimumFireMillis = Math.max(0L, playheadMillis + MIN_ADVANCED_FIRE_LEAD_MILLIS);
+        request.minimumFireMillis = Math.max(
+                AutomixPlan.earliestTailFireMillis(a.durationMillis, overlap),
+                playheadMillis + MIN_ADVANCED_FIRE_LEAD_MILLIS);
 
         AutomixAutoCue.Result result = AutomixAutoCue.plan(request);
         if (result == null) {

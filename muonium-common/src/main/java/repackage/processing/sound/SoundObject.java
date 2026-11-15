@@ -23,7 +23,7 @@ public abstract class SoundObject {
 	protected UnitInputPort amplitude;
 
 	protected float amp = 1.0f;
-	protected boolean isPlaying = false;
+	protected volatile boolean isPlaying = false;
 
 	protected SoundObject() {
 		Engine.getEngine();

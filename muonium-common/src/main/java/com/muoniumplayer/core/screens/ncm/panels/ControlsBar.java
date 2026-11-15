@@ -376,9 +376,8 @@ public class ControlsBar extends NCMPanel {
 
         playPause
                 .setBeforeRenderCallback(() -> {
-                    // 镜像态下出声的是外部播放器，player 恒为 null：图标一律问「现在有没有在响」，
-                    // 它同时覆盖内部暂停与外部暂停两种情况。
-                    boolean showPausingIcon = !CloudMusic.isAudibleNow();
+                    // 下载、解码期间也能暂停：图标跟随播放意图，不能只问此刻有没有声音。
+                    boolean showPausingIcon = !CloudMusic.transportPlaying();
 
                     playPause
                             .center()
@@ -387,6 +386,7 @@ public class ControlsBar extends NCMPanel {
                             .setColor(NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT));
                 })
                 .setOnClickCallback((x, y, i) -> {
+                    if (i != 0) return false;
                     // 走 CloudMusic.togglePlayPause() 而不是直接动 player：一起听房间里传输控制权
                     // 归服务端，那条路径上有房间拦截（房主/管理员变成房间指令，普通成员被挡住）。
                     CloudMusic.togglePlayPause();
@@ -399,6 +399,7 @@ public class ControlsBar extends NCMPanel {
 
         prev
                 .setOnClickCallback((x, y, i) -> {
+                    if (i != 0) return false;
                     // 直播没有上一首：按了只提示，不吞掉点击的反馈。
                     if (com.muoniumplayer.core.ncm.music.LiveStreamSession.isActive()) {
                         DownloadDynamicIsland.showModelOperationResult("广播电台",
@@ -422,6 +423,7 @@ public class ControlsBar extends NCMPanel {
 
         next
                 .setOnClickCallback((x, y, i) -> {
+                    if (i != 0) return false;
                     // 直播没有下一首：同上一首，给一句说明而不是静默吞掉。
                     if (com.muoniumplayer.core.ncm.music.LiveStreamSession.isActive()) {
                         DownloadDynamicIsland.showModelOperationResult("广播电台",
@@ -440,6 +442,9 @@ public class ControlsBar extends NCMPanel {
                             .setColor(NCMScreen.getColor(liveDisabled
                                     ? NCMScreen.ColorType.SECONDARY_TEXT : NCMScreen.ColorType.PRIMARY_TEXT));
                 });
+        playPause.setTooltip(() -> CloudMusic.transportPlaying() ? "暂停" : "播放");
+        prev.setTooltip("上一首");
+        next.setTooltip("下一首");
         // 播放模式与核心控件并列：顺序播放 → 随机播放 → 单曲循环。
         ThemedTextureIconWidget playMode = new ThemedTextureIconWidget(
                 () -> CloudMusic.isPersonalFmActive() ? null : PlayerIconAssets.forPlayMode(CloudMusic.playMode),
@@ -500,14 +505,14 @@ public class ControlsBar extends NCMPanel {
 
         RoundedRectWidget progressBarBg = new RoundedRectWidget() {
 
-            boolean prevMouse = false;
+            final ProgressSeekGesture seekGesture = new ProgressSeekGesture();
 
             @Override
             public void onRender(double mouseX, double mouseY) {
                 super.onRender(mouseX, mouseY);
 
                 if (presentation.preparing) {
-                    prevMouse = Mouse.isButtonDown(0);
+                    seekGesture.cancel(Mouse.isButtonDown(0));
                     // 不把旧歌的 01:14 显示成新歌进度，也不让点击这根等待轨去 seek 旧歌。
                     double travel = .5 - .5 * Math.cos(selectionMotion.travel() * Math.PI * 2);
                     double span = getWidth() * .24;
@@ -516,25 +521,14 @@ public class ControlsBar extends NCMPanel {
                     return;
                 }
 
-                // 触屏时代的点击时机：按下可能是滚动的起手，seek 改在「松手沿 + 这一按
-                // 从头到尾没拖过」（TouchGestures#lastPressWasDrag）时才结算。
-                // prevMouse 仍是按压锁存：按下沿置位，抬起沿结算点按后复位。
-                boolean lmbDownNow = Mouse.isButtonDown(0);
-                boolean tapEdge = prevMouse && !lmbDownNow
-                        && !TouchGestures.get().lastPressWasDrag();
-                if (lmbDownNow) {
-                    prevMouse = true;
-                } else {
-                    prevMouse = false;
-                }
-
                 // 模态浮层（歌词选词、建单、导入等）压在界面上时这一帧的鼠标状态不属于播放条：
                 // 点遮罩的那一下会同时落在这里，把底下的进度条当成拖到起点 seek 到 0——
                 // 用户看到的就是「开了个弹窗，歌回到开头」。命中判定与 Mouse 轮询一起停。
                 boolean modalOpen = NCMScreen.getInstance().isModalOverlayActive();
-                if (modalOpen) {
-                    prevMouse = false;
-                } else if (tapEdge && this.testHovered(mouseX, mouseY, 1)) {
+                boolean tapEdge = seekGesture.sample(Mouse.isButtonDown(0),
+                        this.testHovered(mouseX, mouseY, 1), modalOpen,
+                        TouchGestures.get().lastPressWasDrag());
+                if (tapEdge && this.getWidth() > 0.0) {
                     double xDelta = Math.max(0, Math.min(this.getWidth(), (mouseX - this.getX())));
                     double percent = xDelta / this.getWidth();
 
@@ -680,7 +674,7 @@ public class ControlsBar extends NCMPanel {
                     // 专辑可以是 null（单曲、电台、以及一起听下发的曲目都可能没有专辑），
                     // 那时只显示歌手，不要为了拼一个「 - 」把整条播放条崩掉。
                     Music playing = presentation.displayTrack;
-                    if (presentation.preparing) return "准备播放 · " + playing.getArtistsName() + " · 原曲继续播放";
+                    if (presentation.preparing) return "准备播放 · " + playing.getArtistsName();
                     String album = playing.getAlbum() == null ? null : playing.getAlbum().getName();
                     return album == null || album.isEmpty()
                             ? playing.getArtistsName()
@@ -1215,6 +1209,7 @@ public class ControlsBar extends NCMPanel {
                 : FontManager.pf12bold.getStringWidthD(label);
     }
     private String formatDuration(float totalMillis) {
+        if (!Float.isFinite(totalMillis) || totalMillis < 0f) totalMillis = 0f;
         int totalSeconds = (int) (totalMillis / 1000);
         int hours = totalSeconds / 3600;
         int minutes = (totalSeconds % 3600) / 60;

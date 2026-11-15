@@ -76,16 +76,16 @@ public class Music {
     @SerializedName("id")
     private final long id;
 
-    @SerializedName("ar")
+    @SerializedName(value = "ar", alternate = {"artists"})
     private final List<Artist> artists;
 
     @SerializedName("alia")
     private final List<String> aliasName;
 
-    @SerializedName("al")
+    @SerializedName(value = "al", alternate = {"album"})
     private final Album album;
 
-    @SerializedName("dt")
+    @SerializedName(value = "dt", alternate = {"duration"})
     private final long duration;
 
     /**
@@ -239,7 +239,7 @@ public class Music {
     private transient boolean cloudSong;
     /** 歌曲/特权元数据宣称的最高提供方档位；空表示未提供。 */
     private transient String highestQualityLabel = "";
-    private transient Track muTrack;
+    private transient volatile Track muTrack;
 
     /** 为当前播放请求解析出的实际流质量。 */
     private transient volatile PlaybackQuality playbackQuality = PlaybackQuality.UNKNOWN;
@@ -781,6 +781,9 @@ public class Music {
         copy.kugouCoverTemplate = kugouCoverTemplate;
         copy.muTrack = muTrack;
         copy.vip = vip;
+        copy.fee = fee;
+        copy.payed = payed;
+        copy.highestQualityLabel = highestQualityLabel;
         copy.cloudSong = cloudSong;
         copy.externalCoverUrl = externalCoverUrl;
         copy.foreignCover = foreignCover;
@@ -834,7 +837,7 @@ public class Music {
 
     /** 源元数据时长，回退到解码时测得的长度。 */
     public long getDuration() {
-        return duration > 0L ? duration : decodedDurationMillis;
+        return duration > 0L ? duration : Math.max(0L, decodedDurationMillis);
     }
 
     /** 为一个未携带时长元数据的源记录解码器报告的长度。 */
@@ -857,17 +860,26 @@ public class Music {
     }
 
     public Track toMuTrack() {
-        if (muTrack != null) return muTrack;
+        long durationMillis = getDuration();
+        Track track = muTrack;
+        if (track != null) {
+            if (track.getDurationMs() == durationMillis) return track;
+            track = new Track(track.getSource(), track.getId(), track.getMid(), track.getName(),
+                    track.getArtists(), track.getAlbum(), durationMillis, track.getCoverUrl(), track.getVip());
+            muTrack = track;
+            return track;
+        }
         // 必须走 getSource() 而不是直接读字段：Music 声明了显式构造器，Lombok 的 @Data 因此
         // 不再补无参构造器，Gson 只能用 Unsafe.allocateInstance 建实例 —— 那条路径不执行任何
         // 字段初始化式，所以 `source = MusicPlatform.NETEASE` 这个默认值对所有 JSON 解析出来的
         // 歌曲都不生效，字段实际是 null（歌单、私人 FM、一起听下发的曲目全都如此）。
         // 直接读字段会在这里抛 NPE，把整条歌词链路吞掉（日志里的
         // "[Music/Netease] Lyric failed ... this.source is null" 就是它）。
-        muTrack = new Track(getSource().toMuSource(), getSourceId(), sourceMid, nonNull(name),
-                getArtistsName(), album == null ? "" : nonNull(album.getName()), duration,
+        track = new Track(getSource().toMuSource(), getSourceId(), sourceMid, nonNull(name),
+                getArtistsName(), album == null ? "" : nonNull(album.getName()), durationMillis,
                 getBaseCoverUrl(), vip);
-        return muTrack;
+        muTrack = track;
+        return track;
     }
 
     public String getSourceId() {
@@ -1068,7 +1080,26 @@ public class Music {
             // 避免追加网易云专用 param 导致 404。
             return base.replace("http://", "https://");
         }
-        return base + "?param=" + size + "y" + size;
+        return sizedNeteaseCoverUrl(base, size);
+    }
+
+    private static String sizedNeteaseCoverUrl(String base, int size) {
+        int fragmentAt = base.indexOf('#');
+        String fragment = fragmentAt < 0 ? "" : base.substring(fragmentAt);
+        String clean = fragmentAt < 0 ? base : base.substring(0, fragmentAt);
+        String suffix = "param=" + Math.max(1, size) + "y" + Math.max(1, size);
+        int queryAt = clean.indexOf('?');
+        if (queryAt < 0) return clean + '?' + suffix + fragment;
+
+        String path = clean.substring(0, queryAt);
+        List<String> query = new ArrayList<>();
+        for (String parameter : clean.substring(queryAt + 1).split("&")) {
+            if (!parameter.isEmpty() && !parameter.equals("param") && !parameter.startsWith("param=")) {
+                query.add(parameter);
+            }
+        }
+        query.add(suffix);
+        return path + '?' + String.join("&", query) + fragment;
     }
 
     /**

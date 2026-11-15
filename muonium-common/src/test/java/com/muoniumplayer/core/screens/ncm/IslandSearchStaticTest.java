@@ -91,6 +91,37 @@ class IslandSearchStaticTest {
         IslandSearchModel.reset();
     }
 
+    @Test
+    void editingInputInvalidatesTheOldRequestBeforeDebounceExpires() {
+        IslandSearchModel.reset();
+        IslandSearchModel.onInputChanged("A", 1_000L);
+        IslandSearchModel.consumeDueSearch(1_400L);
+        long first = IslandSearchModel.beginRequest();
+
+        IslandSearchModel.onInputChanged("AB", 1_500L);
+        assertNull(IslandSearchModel.consumeDueSearch(1_600L));
+        long revision = IslandSearchModel.resultsRevision();
+        IslandSearchModel.deliverResults(first, List.of());
+
+        assertFalse(IslandSearchModel.isRequestCurrent(first));
+        assertEquals(revision, IslandSearchModel.resultsRevision());
+        assertFalse(IslandSearchModel.isAwaitingResults());
+        IslandSearchModel.reset();
+    }
+
+    @Test
+    void returningToAnInvalidatedKeywordStartsAFreshSearch() {
+        IslandSearchModel.reset();
+        IslandSearchModel.onInputChanged("A", 1_000L);
+        assertEquals("A", IslandSearchModel.consumeDueSearch(1_400L));
+        IslandSearchModel.beginRequest();
+        IslandSearchModel.onInputChanged("AB", 1_500L);
+        IslandSearchModel.onInputChanged("A", 1_600L);
+
+        assertEquals("A", IslandSearchModel.consumeDueSearch(2_000L));
+        IslandSearchModel.reset();
+    }
+
     // ------------------------------------------------------------------ 纯逻辑：形变插值
 
     @Test
@@ -195,6 +226,31 @@ class IslandSearchStaticTest {
         assertTrue(inner.contains("consumeDueSearch"), "每帧要问防抖到期没有");
         assertTrue(inner.contains("IslandSearchTransition.tick()"),
                 "转场时钟必须在读几何之前推进");
+    }
+
+    @Test
+    void completingASuggestionKeepsKeyboardMouseAndVisibleInputInSync() throws IOException {
+        String source = read(OVERLAY);
+        String keyboard = body(source, "void keyTyped(char typedChar, int keyCode)");
+        String mouse = body(source, "void mouseClickedInner(int mX, int mY, int mouseButton)");
+        assertTrue(keyboard.contains("acceptSearchText(highlightedSuggestionOrText())"));
+        assertTrue(mouse.contains("acceptSearchText(this.suggestions.get(suggestion).text)"));
+        String accept = body(source, "void acceptSearchText(String text)");
+        int visibleText = accept.indexOf("this.searchField.setText(completion)");
+        int request = accept.indexOf("IslandSearchModel.consumeImmediateSearch(completion)");
+        assertTrue(visibleText >= 0 && request > visibleText,
+                "回车接受联想词时必须先同步可见输入，否则输入 A 会挂着 AB 的结果");
+        assertTrue(accept.contains("this.searchField.setCursorPositionEnd()"));
+        assertTrue(accept.contains("this.suggestionsVisible = false"));
+
+        IslandSearchModel.reset();
+        IslandSearchModel.onInputChanged("A", 1_000L);
+        assertEquals("AB", IslandSearchModel.consumeImmediateSearch(" AB "));
+        assertEquals("AB", IslandSearchModel.pendingKeyword());
+        assertEquals("AB", IslandSearchModel.searchedKeyword());
+        assertNull(IslandSearchModel.consumeDueSearch(3_000L),
+                "接受联想后不应再按旧输入重复发搜索");
+        IslandSearchModel.reset();
     }
 
     // ------------------------------------------------------------------ 五树接线

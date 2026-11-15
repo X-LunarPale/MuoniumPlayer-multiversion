@@ -143,6 +143,26 @@ class ManualAutomixSelectionTest {
     }
 
     @Test
+    void reusedReadyDeckDoesNotStartASecondResolverOrReplaceItsOwner() throws Exception {
+        Music song = new StubSong();
+        Object selection = selection(song);
+        Class<?> armedType = Class.forName(ownerType.getName() + "$ArmedTrack");
+        Constructor<?> constructor = armedType.getDeclaredConstructor(Music.class, java.io.File.class,
+                AudioPlayer.class, int.class, long.class, long.class);
+        constructor.setAccessible(true);
+        AudioPlayer deck = (AudioPlayer) unsafe().allocateInstance(AudioPlayer.class);
+        Object ready = constructor.newInstance(song, null, deck, 0, session.sessionId, 0L);
+        set(selection, "ready", ready);
+        set(selection, "worker", Thread.currentThread());
+        set(owner, "manualSelection", selection);
+        prepare(selection);
+        assertSame(ready, get(selection, "ready"));
+        assertNull(get(selection, "failure"));
+        assertNull(get(selection, "worker"));
+        assertSame(session, get(owner, "session"));
+    }
+
+    @Test
     void manualFadeStartsAtBeginningWithSpectralHandoverWithoutAnalysis() throws Exception {
         Method method = ownerType.getDeclaredMethod("manualSelectionPlan");
         method.setAccessible(true);

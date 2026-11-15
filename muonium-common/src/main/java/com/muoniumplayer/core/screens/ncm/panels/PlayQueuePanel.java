@@ -218,7 +218,9 @@ public class PlayQueuePanel extends NCMPanel {
                 : (this.queueTitle() + " · " + this.rows.size() + " 首"), FontManager.pf12bold);
         this.drawer.addChild(title);
         title.setClickable(false);
+        title.setWidthLimitType(LabelWidget.WidthLimitType.TRIM_TO_WIDTH);
         title.setBeforeRenderCallback(() -> title
+                .setMaxWidth(Math.max(0.0, Math.min(140.0, this.drawer.getWidth() - 110.0)))
                 .setColor(NCMScreen.getColor(NCMScreen.ColorType.PRIMARY_TEXT))
                 .setPosition(DRAWER_PADDING + 2.0,
                         DRAWER_PADDING + Math.max(0.0, (HEADER_HEIGHT - title.getHeight()) * .5)));
@@ -226,6 +228,7 @@ public class PlayQueuePanel extends NCMPanel {
         LabelWidget hint = new LabelWidget("拖动可调整顺序", FontManager.pf10bold);
         this.drawer.addChild(hint);
         hint.setClickable(false);
+        hint.setWidthLimitType(LabelWidget.WidthLimitType.TRIM_TO_WIDTH);
         hint.setBeforeRenderCallback(() -> {
             // 刚按过「排列」就把这句换成结果，几秒后自动换回来。换文案而不是加组件：
             // 表头只有 20px 高，挤不进第三个东西，而每条临时提示都要重新算一遍与
@@ -259,6 +262,8 @@ public class PlayQueuePanel extends NCMPanel {
             hint.setColor(NCMScreen.getColor(NCMScreen.ColorType.SECONDARY_TEXT))
                     .setPosition(title.getRelativeX() + title.getWidth() + 8.0,
                             DRAWER_PADDING + Math.max(0.0, (HEADER_HEIGHT - hint.getHeight()) * .5));
+            double available = this.drawer.getWidth() - 102.0 - hint.getRelativeX();
+            hint.setMaxWidth(available >= 50.0 ? available : 0.0);
         });
 
         // 进阶模式的「一键排列」：只在总开关开着时出现。关掉它就等于这个功能不存在——
@@ -270,10 +275,11 @@ public class PlayQueuePanel extends NCMPanel {
             // 少于两首待播没有「相邻」可言，与「清空」同一个做法：连同命中框一起收掉。
             // 正在排的时候不收：那时它写的是「取消」，收掉就没法停了。
             // 房间模式下排的是别人的队列（本地段在房间里永远为空），整个功能不存在。
-            flowSort.setHidden(this.roomMode
+            boolean visible = !(this.roomMode
                     || (!com.muoniumplayer.core.ncm.music.QueueFlowSorter.isRunning()
                     && (this.rows.size() < 2
                     || !com.muoniumplayer.core.ncm.music.AutomixSettings.isAdvancedModeEnabled())));
+            flowSort.setAlpha(visible ? 1f : 0f).setClickable(visible);
             flowSort.setBounds(FLOW_BUTTON_WIDTH, 14.0)
                     .setPosition(this.drawer.getWidth() - DRAWER_PADDING - 16.0 - 4.0 - 34.0
                                     - 4.0 - FLOW_BUTTON_WIDTH,
@@ -320,7 +326,8 @@ public class PlayQueuePanel extends NCMPanel {
             // 队列为空时没有可清空的内容，按钮连同命中框一起收掉。
             // 房间模式里清空是发全房的一条指令：清空权跟着房间面板「清空歌单」同一个判据，
             // 没有控制权的成员根本不该看到这颗按钮。
-            clearAll.setHidden(this.rows.isEmpty() || (this.roomMode && !this.room.canClear()));
+            boolean visible = !(this.rows.isEmpty() || (this.roomMode && !this.room.canClear()));
+            clearAll.setAlpha(visible ? 1f : 0f).setClickable(visible);
             clearAll.setBounds(34.0, 14.0)
                     .setPosition(this.drawer.getWidth() - DRAWER_PADDING - 16.0 - 4.0 - 34.0,
                             DRAWER_PADDING + Math.max(0.0, (HEADER_HEIGHT - 14.0) * .5))
@@ -373,6 +380,7 @@ public class PlayQueuePanel extends NCMPanel {
         this.emptyHint = new LabelWidget("队列为空 · 点击歌曲右侧的排队按钮加入", FontManager.pf10bold);
         this.drawer.addChild(this.emptyHint);
         this.emptyHint.setClickable(false);
+        this.emptyHint.setWidthLimitType(LabelWidget.WidthLimitType.TRIM_TO_WIDTH);
         this.emptyHint.setBeforeRenderCallback(() -> {
             // 房间模式那句空提示是另一句人话（能不能点歌、去哪点），每帧按模式换文案而不是加组件。
             String wanted = this.roomMode ? this.room.emptyHint()
@@ -382,6 +390,7 @@ public class PlayQueuePanel extends NCMPanel {
                 this.emptyHint.setLabel(wanted);
             }
             this.emptyHint
+                    .setMaxWidth(Math.max(0.0, this.list.getWidth() - 12.0))
                     .setColor(NCMScreen.getColor(NCMScreen.ColorType.SECONDARY_TEXT))
                     .setPosition(this.list.getRelativeX() + Math.max(0.0, (this.list.getWidth() - this.emptyHint.getWidth()) * .5),
                             this.list.getRelativeY() + Math.max(0.0, (this.list.getHeight() - this.emptyHint.getHeight()) * .5));
@@ -419,8 +428,7 @@ public class PlayQueuePanel extends NCMPanel {
         double panelHeight = this.getHeight();
         // 抽屉收窄到不到一半，并把右边缘贴到触发它的那颗按钮上：原来它相对内容区居中，
         // 和按钮零几何关系，点开之后视线要从按钮横穿半屏去找这块面板。
-        double drawerWidth = Math.max(150.0,
-                Math.min(panelWidth - DRAWER_INSET * 2.0, panelWidth * .46));
+        double drawerWidth = drawerWidthFor(panelWidth);
         // 锚点进来的是那枚按钮的绝对 x，而这一层所有坐标都是「相对本面板」的：不减掉面板自己的
         // 绝对 x，抽屉就会整体往右跑一个面板宽度的距离（客户端里量过一次，右边缘落在按钮右边约 300）。
         double drawerRight = Double.isNaN(this.anchorRight)
@@ -495,6 +503,11 @@ public class PlayQueuePanel extends NCMPanel {
         for (QueueRow row : this.fadingRows) lifted = Math.max(lifted, row.lift);
         this.dragOverhangX = Math.min(DRAWER_PADDING, this.list.getWidth() * DRAG_LIFT_SCALE * lifted * .5);
         this.dragOverhangY = Math.min(DRAWER_PADDING, ROW_HEIGHT * DRAG_LIFT_SCALE * lifted * .5);
+    }
+
+    static double drawerWidthFor(double panelWidth) {
+        return Math.max(0.0, Math.min(panelWidth - DRAWER_INSET * 2.0,
+                Math.max(280.0, panelWidth * .46)));
     }
 
     /** 把一行搬到它这一帧该在的位置，并处理视口内外的可见性与命中框。 */

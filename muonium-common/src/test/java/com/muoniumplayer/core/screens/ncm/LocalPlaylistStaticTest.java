@@ -132,10 +132,13 @@ class LocalPlaylistStaticTest {
                         && body.indexOf("isLocalPlaylist()", guard)
                                 < body.indexOf("getPlatform() == MusicPlatform.KUGOU", guard),
                 "本地单的 platform 字段顶着 NETEASE，不做这道早退就会拿负数 id 去调网易云的订阅接口");
-        // 那一格换成重命名之后，搜索框的锚点必须知道它在同一排。
-        int anchor = indexOf(body, "double searchAnchorX", "搜索框锚点");
-        assertTrue(body.indexOf("btnRename.getRelativeX()", anchor) < anchor + 700,
-                "搜索框还按「收藏不画就等于没控件」算锚点：会压在重命名那颗上面");
+        // 重命名与筛选框共用一个排版器，不能各自按收藏按钮的位置猜坐标。
+        int rename = indexOf(body, "placeHeaderAction(btnRename, toolbar", "重命名槽位");
+        int search = indexOf(body, "placeHeaderAction(searchBar, toolbar", "搜索框槽位");
+        assertTrue(rename < search, "搜索框必须排在重命名已领取的槽位之后");
+        int placement = indexOf(body, "private static void placeHeaderAction", "工具栏布局");
+        assertTrue(body.indexOf("toolbar.next(width)", placement) > placement,
+                "按钮必须向同一排版器领取下一格，窄窗换行才不会重叠");
     }
 
     @Test
@@ -153,6 +156,11 @@ class LocalPlaylistStaticTest {
         assertTrue(body.indexOf("LocalPlaylistStore.hasAny()", canAdd) > 0
                         && body.indexOf("LocalPlaylistStore.hasAny()", canAdd) < canAdd + 400,
                 "「加入歌单」仍然只认网易云/酷狗：B 站、GD 那些歌没有入口加进本地单");
+        int addLayout = indexOf(body, "btnAddToPlaylist.setBeforeRenderCallback", "加入歌单图标布局");
+        int addAnchor = indexOf(body, "likeable ? like.getRelativeX() : actionsAnchorX(lblMusicDuration)", "加号锚点");
+        assertTrue(addAnchor > addLayout
+                        && addAnchor < body.indexOf("btnAddToPlaylist.setOnClickCallback", addLayout),
+                "不支持红心的音源也能加入本地单：加号必须退回时长槽位，不能锚到没渲染的红心坐标");
     }
 
     @Test

@@ -3,6 +3,7 @@ package com.muoniumplayer.core.ncm.music;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Folia 规划的数值契约，源存在性测试无法覆盖这些约束。 */
@@ -58,6 +59,17 @@ class FoliaAutomixNumericTest {
     void unimplementedEchoIsNotAdvertisedByThePlan() {
         AutomixPlan plan = plan(1f, FoliaTransitionStyle.BEAT_CUT, .42, .42, .45);
         assertTrue(!plan.echoThrow);
+    }
+
+    @Test
+    void automaticCueCannotReplaceTheSongHalfwayThrough() {
+        AutomixPlan early = plan(1f, FoliaTransitionStyle.BASS_SWAP, .42, .42, .45);
+        assertFalse(early.staysWithinTail(180_000L));
+        assertEquals(168_000L, AutomixPlan.earliestTailFireMillis(180_000L, 8_000L));
+        assertEquals(155_000L, AutomixPlan.earliestTailFireMillis(180_000L, 25_000L));
+        assertTrue(early.staysWithinTail(72_000L));
+        assertFalse(early.staysWithinTail(72_001L));
+        assertFalse(early.staysWithinTail(0L));
     }
 
     private static AutomixPlan plan(float tempo, FoliaTransitionStyle style,

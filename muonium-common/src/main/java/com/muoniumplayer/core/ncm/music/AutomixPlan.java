@@ -27,6 +27,15 @@ package com.muoniumplayer.core.ncm.music;
  */
 final class AutomixPlan {
 
+    static long earliestTailFireMillis(long durationMillis, long overlapMillis) {
+        return Math.max(0L, durationMillis - Math.max(12_000L, overlapMillis));
+    }
+
+    boolean staysWithinTail(long durationMillis) {
+        return durationMillis > 0L
+                && fireMillis >= earliestTailFireMillis(durationMillis, overlapMillis);
+    }
+
     /** 到渐变的这一点时，退出方低频段已完全让开。 */
     private static final double BASS_CUT_COMPLETE = .5;
     /** 接入方低频段一直压到这里，然后抬升。 */
